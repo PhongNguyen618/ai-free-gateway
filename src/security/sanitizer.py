@@ -60,10 +60,12 @@ class DLPSanitizer:
         entropy_threshold: float = 4.5,
         entropy_min_length: int = 20,
         enable_entropy: bool = True,
+        custom_blocklist: Optional[List[str]] = None,
     ):
         self.entropy_threshold = entropy_threshold
         self.entropy_min_length = entropy_min_length
         self.enable_entropy = enable_entropy
+        self.custom_blocklist = [w.strip() for w in (custom_blocklist or []) if w and w.strip()]
 
         # Precompiled regex patterns ordered by specificity and risk
         self.rules: List[Dict[str, Any]] = [
@@ -162,6 +164,16 @@ class DLPSanitizer:
             },
         ]
 
+        # Dynamically append custom blocklist rules
+        for kw in self.custom_blocklist:
+            escaped_kw = re.escape(kw)
+            self.rules.append({
+                "name": f"Custom Blocklist ({kw})",
+                "type": "CUSTOM_BLOCK",
+                "risk": "MEDIUM",
+                "pattern": re.compile(rf"\b{escaped_kw}\b", re.IGNORECASE),
+            })
+
         # Regex to scan for high-entropy standalone tokens (hex/base64/keys)
         self.entropy_candidate_pattern = re.compile(
             r"\b[A-Za-z0-9_\-+/=]{" + str(self.entropy_min_length) + r",}\b"
@@ -227,6 +239,14 @@ class DLPSanitizer:
             for match in self.entropy_candidate_pattern.finditer(text):
                 candidate = match.group(0)
                 start, end = match.span(0)
+
+                # Skip tokens that do NOT contain at least one digit (eliminates long code identifiers)
+                if not any(c.isdigit() for c in candidate):
+                    continue
+
+                # Skip snake_case identifiers (e.g. user_authentication_service_provider)
+                if candidate.count("_") >= 2:
+                    continue
 
                 # Check if this span is already covered by a regex rule
                 if any(s["start"] <= start and s["end"] >= end for s in raw_spans):

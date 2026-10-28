@@ -55,6 +55,7 @@ class DLPConfig(BaseModel):
     approval_timeout_seconds: int = Field(default=60)
     approval_timeout_action: str = Field(default="reject")
     redacted_token_format: str = Field(default="<REDACTED_{TYPE}_{INDEX}>")
+    custom_blocklist: List[str] = Field(default_factory=list)
 
 
 class StaticModelConfig(BaseModel):

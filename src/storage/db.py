@@ -22,7 +22,10 @@ def ensure_db_dir(db_path: str) -> None:
 @asynccontextmanager
 async def get_db(db_path: str) -> AsyncIterator[aiosqlite.Connection]:
     ensure_db_dir(db_path)
-    async with aiosqlite.connect(db_path) as conn:
+    async with aiosqlite.connect(db_path, timeout=15.0) as conn:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA synchronous=NORMAL;")
+        await conn.execute("PRAGMA busy_timeout=5000;")
         conn.row_factory = aiosqlite.Row
         yield conn
 

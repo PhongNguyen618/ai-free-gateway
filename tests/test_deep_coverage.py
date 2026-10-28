@@ -312,3 +312,128 @@ async def test_api_quotas_and_logs_endpoints():
         h_resp = await client.post("/api/harvester/trigger")
         assert h_resp.status_code == 200
         assert "status" in h_resp.json()
+
+
+# =========================================================================
+# 6. REGRESSION TESTS FOR PATCHES
+# =========================================================================
+
+def test_entropy_ignores_long_code_identifiers():
+    sanitizer = DLPSanitizer(enable_entropy=True)
+    code_prompt = "def AuthenticationMiddlewareConfiguration(user_authentication_service_provider):"
+    res_code = sanitizer.sanitize_text(code_prompt)
+    assert res_code.max_risk_level == "NONE"
+    assert len(res_code.findings) == 0
+    assert res_code.text == code_prompt
+
+    # Real random secret token with mixed digits must be flagged
+    secret = "x9Kp2Lm8Qv4Zn7Rt1Yw5Bc3Df6Gh"
+    res_secret = sanitizer.sanitize_text(f"Token is {secret}")
+    assert res_secret.max_risk_level == "HIGH"
+    assert any(f.entity_type == "HIGH_ENTROPY" for f in res_secret.findings)
+    assert secret not in res_secret.text
+
+
+def test_custom_blocklist_redaction_and_restoration():
+    blocklist = ["ProjectOmega", "scada-master-01"]
+    sanitizer = DLPSanitizer(custom_blocklist=blocklist)
+    text = "Deploying ProjectOmega on node scada-master-01 for maintenance."
+    res = sanitizer.sanitize_text(text)
+    assert "ProjectOmega" not in res.text
+    assert "scada-master-01" not in res.text
+    assert "<REDACTED_CUSTOM_BLOCK_" in res.text
+    assert res.max_risk_level == "MEDIUM"
+
+    # Test restoration
+    restored = sanitizer.restore_text(res.text, res.reverse_map)
+    assert restored == text
+
+
+@pytest.mark.asyncio
+async def test_streaming_429_failover(monkeypatch):
+    """
+    Verify that when stream=True and the first provider (groq) raises
+    httpx.HTTPStatusError with status 429, the proxy records cooldown for groq
+    and transparently streams the response from the second fallback provider
+    (openrouter) with HTTP 200.
+    """
+    import time
+    from fastapi import FastAPI
+    config = get_config()
+    test_db = f"storage/test_stream_429_{int(time.time() * 1000)}.db"
+    await storage_db.init_db(test_db)
+
+    await storage_db.upsert_model(test_db, {
+        "id": "groq/llama-3.3-70b-versatile",
+        "provider": "groq",
+        "model_name": "llama-3.3-70b-versatile",
+        "context_length": 128000,
+        "is_free": True,
+        "is_active": True,
+        "latency_ms": 40.0,
+    })
+    await storage_db.upsert_model(test_db, {
+        "id": "openrouter/auto",
+        "provider": "openrouter",
+        "model_name": "auto",
+        "context_length": 128000,
+        "is_free": True,
+        "is_active": True,
+        "latency_ms": 90.0,
+    })
+
+    test_config = config.model_copy()
+    test_config.db_path = test_db
+    test_config.dlp.risk_action.medium = "redact"
+
+    egress = EgressGuard(whitelist_domains=test_config.egress.whitelist_domains)
+    approval_gate = ApprovalGate(db_path=test_db)
+    balancer = ModelBalancer(config=test_config)
+    harvester = ModelHarvester(config=test_config, egress_guard=egress)
+
+    attempted_streams = []
+
+    async def mock_stream_post(url, headers=None, json_data=None):
+        if "api.groq.com" in url:
+            attempted_streams.append("groq")
+            req = httpx.Request("POST", url)
+            resp = httpx.Response(429, text="Rate limit exceeded", request=req)
+            raise httpx.HTTPStatusError("Rate limit exceeded", request=req, response=resp)
+        elif "openrouter.ai" in url:
+            attempted_streams.append("openrouter")
+            yield b'data: {"choices":[{"delta":{"content":"Fallback stream successful"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    monkeypatch.setattr(egress, "stream_post", mock_stream_post)
+
+    test_app = FastAPI()
+    router = create_openai_router(test_config, egress, approval_gate, balancer, harvester)
+    test_app.include_router(router)
+
+    transport = ASGITransport(app=test_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "groq/llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": "Ping!"}],
+                "stream": True,
+            }
+        )
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        assert "Fallback stream successful" in resp.text
+        assert attempted_streams == ["groq", "openrouter"]
+
+        # Verify groq cooldown recorded in DB
+        assert await storage_db.is_provider_in_cooldown(test_db, "groq") is True
+
+    await egress.close()
+    await asyncio.sleep(0.1)
+    import os
+    if os.path.exists(test_db):
+        try:
+            os.remove(test_db)
+        except Exception:
+            pass

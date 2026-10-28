@@ -76,7 +76,7 @@ class ApprovalGate:
         async with self._lock:
             self._gates[approval_id] = item
 
-        # Persist to local database
+        # Persist to local database (NEVER write raw secrets/mapping to disk)
         await storage_db.insert_pending_approval(
             self.db_path,
             {
@@ -89,8 +89,8 @@ class ApprovalGate:
                 "model_requested": model_requested,
                 "findings": findings,
                 "sanitized_messages": sanitized_messages,
-                "mapping": mapping,
-                "raw_payload": raw_payload,
+                "mapping": {},
+                "raw_payload": {"model": model_requested, "messages": sanitized_messages},
             },
         )
 

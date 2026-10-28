@@ -31,6 +31,7 @@ def create_openai_router(
         entropy_threshold=config.dlp.entropy_scan.threshold,
         entropy_min_length=config.dlp.entropy_scan.min_length,
         enable_entropy=config.dlp.entropy_scan.enabled,
+        custom_blocklist=config.dlp.custom_blocklist,
     )
 
     async def verify_gateway_auth(authorization: Optional[str] = Header(None)) -> None:
@@ -104,14 +105,26 @@ def create_openai_router(
         if not messages:
             raise HTTPException(status_code=400, detail="Field 'messages' is required and cannot be empty")
 
-        # 1. DLP Scan & Reversible Pseudonymization
-        sanitized_messages, findings, reverse_map, max_risk = sanitizer.sanitize_messages(messages)
+        # 1. DLP Scan & Reversible Pseudonymization (Respect config.dlp.enabled)
+        if config.dlp.enabled:
+            sanitized_messages, findings, reverse_map, max_risk = sanitizer.sanitize_messages(messages)
+        else:
+            sanitized_messages, findings, reverse_map, max_risk = messages, [], {}, "NONE"
+
+        # PATCH 1: Extract prompt_snippet strictly from sanitized_messages to prevent secrets leaking to SQLite disk
         prompt_snippet = ""
-        for msg in messages:
+        for msg in sanitized_messages:
             content = msg.get("content", "")
             if isinstance(content, str) and content:
                 prompt_snippet = content[:150]
                 break
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        prompt_snippet = str(part.get("text", ""))[:150]
+                        break
+                if prompt_snippet:
+                    break
 
         findings_dict_list = [
             {
@@ -128,80 +141,43 @@ def create_openai_router(
         if findings:
             action_taken = "REDACTED"
 
-        # 2. Risk Action & Human-in-the-Loop Gate
-        if max_risk == "HIGH":
-            risk_decision = config.dlp.risk_action.high
-            if risk_decision == "reject":
-                await storage_db.insert_dlp_log(config.db_path, {
-                    "client_ip": client_ip,
-                    "direction": "request",
-                    "risk_level": max_risk,
-                    "findings": findings_dict_list,
-                    "redaction_count": len(findings),
-                    "action_taken": "BLOCKED_HIGH_RISK",
-                    "prompt_snippet": prompt_snippet,
-                })
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "error": {
-                            "message": "Request blocked by Zero-Trust DLP: High-risk secrets (API keys/private credentials) detected.",
-                            "type": "dlp_violation",
-                            "findings_count": len(findings),
-                        }
-                    },
-                )
-            elif risk_decision == "approve":
-                app_id = await approval_gate.create_request(
-                    risk_level="HIGH",
-                    client_ip=client_ip,
-                    model_requested=requested_model,
-                    findings=findings_dict_list,
-                    sanitized_messages=sanitized_messages,
-                    mapping=reverse_map,
-                    raw_payload=body,
-                    timeout_seconds=config.dlp.approval_timeout_seconds,
-                )
-                decision, _ = await approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
-                if decision != "approved":
-                    action_taken = "REJECTED_BY_ADMIN" if decision == "rejected" else "EXPIRED"
+        # 2. Risk Action & Human-in-the-Loop Gate (only if DLP enabled)
+        if config.dlp.enabled:
+            if max_risk == "HIGH":
+                risk_decision = config.dlp.risk_action.high
+                if risk_decision == "reject":
                     await storage_db.insert_dlp_log(config.db_path, {
                         "client_ip": client_ip,
                         "direction": "request",
                         "risk_level": max_risk,
                         "findings": findings_dict_list,
                         "redaction_count": len(findings),
-                        "action_taken": action_taken,
+                        "action_taken": "BLOCKED_HIGH_RISK",
                         "prompt_snippet": prompt_snippet,
                     })
                     raise HTTPException(
                         status_code=403,
                         detail={
                             "error": {
-                                "message": f"Request {decision} by admin approval gate.",
-                                "type": "approval_rejected",
+                                "message": "Request blocked by Zero-Trust DLP: High-risk secrets (API keys/private credentials) detected.",
+                                "type": "dlp_violation",
+                                "findings_count": len(findings),
                             }
                         },
                     )
-
-        elif max_risk == "MEDIUM":
-            risk_decision = config.dlp.risk_action.medium
-            if risk_decision == "approve":
-                app_id = await approval_gate.create_request(
-                    risk_level="MEDIUM",
-                    client_ip=client_ip,
-                    model_requested=requested_model,
-                    findings=findings_dict_list,
-                    sanitized_messages=sanitized_messages,
-                    mapping=reverse_map,
-                    raw_payload=body,
-                    timeout_seconds=config.dlp.approval_timeout_seconds,
-                )
-                decision, _ = await approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
-                if decision != "approved":
-                    if decision == "expired" and config.dlp.approval_timeout_action == "redact":
-                        action_taken = "TIMEOUT_AUTO_REDACTED"
-                    else:
+                elif risk_decision == "approve":
+                    app_id = await approval_gate.create_request(
+                        risk_level="HIGH",
+                        client_ip=client_ip,
+                        model_requested=requested_model,
+                        findings=findings_dict_list,
+                        sanitized_messages=sanitized_messages,
+                        mapping=reverse_map,
+                        raw_payload=body,
+                        timeout_seconds=config.dlp.approval_timeout_seconds,
+                    )
+                    decision, _ = await approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
+                    if decision != "approved":
                         action_taken = "REJECTED_BY_ADMIN" if decision == "rejected" else "EXPIRED"
                         await storage_db.insert_dlp_log(config.db_path, {
                             "client_ip": client_ip,
@@ -214,21 +190,59 @@ def create_openai_router(
                         })
                         raise HTTPException(
                             status_code=403,
-                            detail={"error": {"message": f"Request {decision} by Human-in-the-Loop policy."}},
+                            detail={
+                                "error": {
+                                    "message": f"Request {decision} by admin approval gate.",
+                                    "type": "approval_rejected",
+                                }
+                            },
                         )
 
-        # 3. Log DLP event
-        await storage_db.insert_dlp_log(config.db_path, {
-            "client_ip": client_ip,
-            "direction": "request",
-            "risk_level": max_risk,
-            "findings": findings_dict_list,
-            "redaction_count": len(findings),
-            "action_taken": action_taken,
-            "prompt_snippet": prompt_snippet,
-        })
+            elif max_risk == "MEDIUM":
+                risk_decision = config.dlp.risk_action.medium
+                if risk_decision == "approve":
+                    app_id = await approval_gate.create_request(
+                        risk_level="MEDIUM",
+                        client_ip=client_ip,
+                        model_requested=requested_model,
+                        findings=findings_dict_list,
+                        sanitized_messages=sanitized_messages,
+                        mapping=reverse_map,
+                        raw_payload=body,
+                        timeout_seconds=config.dlp.approval_timeout_seconds,
+                    )
+                    decision, _ = await approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
+                    if decision != "approved":
+                        if decision == "expired" and config.dlp.approval_timeout_action == "redact":
+                            action_taken = "TIMEOUT_AUTO_REDACTED"
+                        else:
+                            action_taken = "REJECTED_BY_ADMIN" if decision == "rejected" else "EXPIRED"
+                            await storage_db.insert_dlp_log(config.db_path, {
+                                "client_ip": client_ip,
+                                "direction": "request",
+                                "risk_level": max_risk,
+                                "findings": findings_dict_list,
+                                "redaction_count": len(findings),
+                                "action_taken": action_taken,
+                                "prompt_snippet": prompt_snippet,
+                            })
+                            raise HTTPException(
+                                status_code=403,
+                                detail={"error": {"message": f"Request {decision} by Human-in-the-Loop policy."}},
+                            )
 
-        # 4. Prepare sanitized payload
+            # 3. Log DLP event
+            await storage_db.insert_dlp_log(config.db_path, {
+                "client_ip": client_ip,
+                "direction": "request",
+                "risk_level": max_risk,
+                "findings": findings_dict_list,
+                "redaction_count": len(findings),
+                "action_taken": action_taken,
+                "prompt_snippet": prompt_snippet,
+            })
+
+        # 4. Prepare outgoing payload
         outgoing_payload = dict(body)
         outgoing_payload["messages"] = sanitized_messages
 
@@ -260,7 +274,7 @@ def create_openai_router(
             try:
                 # --- CASE A: STREAMING (Server-Sent Events) ---
                 if is_stream:
-                    stream_generator = _handle_streaming_proxy(
+                    stream_gen = _handle_streaming_proxy(
                         egress_guard=egress_guard,
                         target_url=target_url,
                         headers=headers,
@@ -269,7 +283,45 @@ def create_openai_router(
                         reverse_map=reverse_map if config.dlp.pseudonymize_reversible else {},
                         config=config,
                     )
-                    return StreamingResponse(stream_generator, media_type="text/event-stream")
+
+                    # PATCH 2: Pull the first chunk to test provider response before returning StreamingResponse
+                    try:
+                        first_chunk = await stream_gen.__anext__()
+                    except StopAsyncIteration:
+                        first_chunk = None
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 429:
+                            cooldown_sec = 300
+                            p_cfg = getattr(config.providers, provider, None)
+                            if p_cfg:
+                                cooldown_sec = p_cfg.cooldown_seconds_on_429
+                            await storage_db.set_provider_cooldown(
+                                config.db_path, provider, cooldown_sec, 429, "Rate limit exceeded"
+                            )
+                        await storage_db.update_model_metrics(
+                            config.db_path, candidate["id"], 500.0, False
+                        )
+                        last_error = f"Stream provider {provider} returned HTTP {e.response.status_code}"
+                        continue
+                    except Exception as e:
+                        await storage_db.update_model_metrics(
+                            config.db_path, candidate["id"], 500.0, False
+                        )
+                        last_error = f"Stream provider {provider} connection failed: {e}"
+                        continue
+
+                    # Chain first_chunk + rest of generator
+                    async def stream_chained_wrapper(initial_item, rest_gen):
+                        if initial_item is not None:
+                            yield initial_item
+                        async for item in rest_gen:
+                            yield item
+
+                    await storage_db.update_model_metrics(config.db_path, candidate["id"], 150.0, True)
+                    return StreamingResponse(
+                        stream_chained_wrapper(first_chunk, stream_gen),
+                        media_type="text/event-stream"
+                    )
 
                 # --- CASE B: STANDARD JSON RESPONSE ---
                 resp = await egress_guard.post(target_url, headers=headers, json_data=provider_payload)
@@ -340,19 +392,28 @@ async def _handle_streaming_proxy(
     config: AppConfig,
 ) -> AsyncIterator[bytes]:
     """
-    Handles streaming responses with chunk-level reversible pseudonymization restoration.
+    Handles streaming responses with chunk-level reversible pseudonymization restoration
+    and TCP line-buffering to prevent SSE fragmentation errors.
     """
     restorer = StreamingRestorer(reverse_map)
     provider = candidate["provider"]
     tokens_estimated = 0
+    line_buffer = ""
+    has_started = False
 
     try:
         async for chunk_bytes in egress_guard.stream_post(target_url, headers=headers, json_data=payload):
+            has_started = True
             chunk_str = chunk_bytes.decode("utf-8", errors="ignore")
-            lines = chunk_str.split("\n")
-            output_lines = []
+            line_buffer += chunk_str
 
-            for line in lines:
+            # PATCH 2: Process only complete lines terminated by \n to resist TCP chunk fragmentation
+            while "\n" in line_buffer:
+                line, line_buffer = line_buffer.split("\n", 1)
+                line = line.strip("\r")
+                if not line:
+                    continue
+
                 if line.startswith("data: "):
                     data_str = line[6:].strip()
                     if data_str == "[DONE]":
@@ -365,8 +426,8 @@ async def _handle_streaming_proxy(
                                 "model": candidate["model_name"],
                                 "choices": [{"index": 0, "delta": {"content": flushed}, "finish_reason": None}],
                             }
-                            output_lines.append(f"data: {json.dumps(done_chunk)}\n\n")
-                        output_lines.append("data: [DONE]\n\n")
+                            yield f"data: {json.dumps(done_chunk)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
                     else:
                         try:
                             chunk_obj = json.loads(data_str)
@@ -377,19 +438,19 @@ async def _handle_streaming_proxy(
                                 if isinstance(content, str):
                                     tokens_estimated += 1
                                     delta["content"] = restorer.feed(content)
-                            output_lines.append(f"data: {json.dumps(chunk_obj)}\n\n")
+                            yield f"data: {json.dumps(chunk_obj)}\n\n".encode("utf-8")
                         except Exception:
-                            output_lines.append(line + "\n")
-                elif line:
-                    output_lines.append(line + "\n")
-
-            if output_lines:
-                yield "".join(output_lines).encode("utf-8")
+                            yield (line + "\n\n").encode("utf-8")
+                else:
+                    yield (line + "\n\n").encode("utf-8")
 
         # Increment quota count after stream completion
         await storage_db.increment_provider_usage(config.db_path, provider, tokens_estimated)
 
     except Exception as e:
+        if not has_started:
+            # Let caller handle failover if stream hasn't produced data yet
+            raise
         logger.error(f"Stream error on candidate {candidate['id']}: {e}")
         err_msg = json.dumps({"error": {"message": str(e), "type": "stream_error"}})
         yield f"data: {err_msg}\n\ndata: [DONE]\n\n".encode("utf-8")

@@ -17,6 +17,7 @@ egress:
 
 dlp:
   enabled: true
+  custom_blocklist: []
   entropy_scan:
     enabled: true
     threshold: 4.5
