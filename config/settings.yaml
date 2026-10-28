@@ -1,0 +1,89 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+  debug: false
+  gateway_api_key: ""  # Optional: Protect gateway itself with a master bearer key
+
+egress:
+  whitelist_domains:
+    - "openrouter.ai"
+    - "api.groq.com"
+    - "generativelanguage.googleapis.com"
+    - "models.inference.ai.azure.com"
+    - "api.github.com"
+  timeout_seconds: 60.0
+  max_request_bytes: 10485760 # 10MB
+  block_private_ips: true
+
+dlp:
+  enabled: true
+  entropy_scan:
+    enabled: true
+    threshold: 4.5
+    min_length: 20
+  risk_action:
+    high: "reject"      # reject | approve | redact
+    medium: "approve"   # approve | redact | allow
+    low: "redact"       # redact | allow
+  pseudonymize_reversible: true
+  approval_timeout_seconds: 60
+  approval_timeout_action: "reject" # reject | redact
+  redacted_token_format: "<REDACTED_{TYPE}_{INDEX}>"
+
+providers:
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    models_endpoint: "https://openrouter.ai/api/v1/models"
+    api_key_env: "OPENROUTER_API_KEY"
+    cooldown_seconds_on_429: 300
+    free_suffix: ":free"
+  groq:
+    enabled: true
+    base_url: "https://api.groq.com/openai/v1"
+    api_key_env: "GROQ_API_KEY"
+    cooldown_seconds_on_429: 300
+    static_free_models:
+      - id: "llama-3.3-70b-versatile"
+        context_length: 128000
+      - id: "llama-3.1-8b-instant"
+        context_length: 128000
+      - id: "gemma2-9b-it"
+        context_length: 8192
+      - id: "mixtral-8x7b-32768"
+        context_length: 32768
+  gemini:
+    enabled: true
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    api_key_env: "GEMINI_API_KEY"
+    cooldown_seconds_on_429: 300
+    static_free_models:
+      - id: "gemini-1.5-flash"
+        context_length: 1048576
+      - id: "gemini-1.5-flash-8b"
+        context_length: 1048576
+      - id: "gemini-2.0-flash-exp"
+        context_length: 1048576
+  github:
+    enabled: true
+    base_url: "https://models.inference.ai.azure.com"
+    api_key_env: "GITHUB_TOKEN"
+    cooldown_seconds_on_429: 300
+    static_free_models:
+      - id: "gpt-4o-mini"
+        context_length: 128000
+      - id: "Meta-Llama-3.1-8B-Instruct"
+        context_length: 128000
+      - id: "Meta-Llama-3.1-70B-Instruct"
+        context_length: 128000
+      - id: "Phi-3.5-mini-instruct"
+        context_length: 128000
+
+harvester:
+  poll_interval_seconds: 300
+  auto_discover_openrouter: true
+  health_check_interval_seconds: 600
+  default_fallback_models:
+    - "groq/llama-3.3-70b-versatile"
+    - "openrouter/auto"
+    - "gemini/gemini-1.5-flash"

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables & Secrets (CRITICAL for Zero-Trust)
+config/.env
+.env
+*.env
+
+# Local SQLite Storage & Databases
+storage/*.db
+storage/*.sqlite3
+*.db
+*.sqlite3
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

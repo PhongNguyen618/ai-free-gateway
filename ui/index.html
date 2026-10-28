@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Free Gateway - Zero-Trust DLP & Free-Tier Harvester</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              500: '#22c55e',
+              600: '#16a34a',
+              700: '#15803d',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.125rem 0.5rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .custom-scroll::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .custom-scroll::-webkit-scrollbar-track {
+      background: #1e293b;
+    }
+    .custom-scroll::-webkit-scrollbar-thumb {
+      background: #475569;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col antialiased">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+          <svg class="w-6 h-6 text-slate-950 font-bold" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+            AI Free Gateway
+            <span class="text-xs font-medium px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Zero-Trust</span>
+          </h1>
+          <p class="text-xs text-slate-400">OpenAI-Compatible Proxy & Free-Tier AI Harvester</p>
+        </div>
+      </div>
+
+      <div class="flex items-center space-x-3">
+        <div class="flex items-center space-x-2 text-xs text-slate-400 bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span id="gateway-endpoint">http://127.0.0.1:8000/v1</span>
+        </div>
+        <button id="btn-harvest" onclick="triggerHarvest()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg border border-slate-700 transition flex items-center space-x-1.5">
+          <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+          </svg>
+          <span>Harvest Now</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+
+    <!-- KPI Metric Cards -->
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-400 font-medium">Active Free Models</div>
+        <div id="stat-models" class="text-2xl font-bold text-white mt-1">--</div>
+        <div class="text-xs text-emerald-400 mt-1 flex items-center gap-1">
+          <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          Ready to route
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-400 font-medium">Requests Today</div>
+        <div id="stat-requests" class="text-2xl font-bold text-white mt-1">--</div>
+        <div class="text-xs text-slate-500 mt-1">Through proxy</div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-400 font-medium">Tokens Today</div>
+        <div id="stat-tokens" class="text-2xl font-bold text-white mt-1">--</div>
+        <div class="text-xs text-slate-500 mt-1">Processed</div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-400 font-medium">Pending Approvals</div>
+        <div id="stat-pending" class="text-2xl font-bold text-amber-400 mt-1">--</div>
+        <div class="text-xs text-amber-500/80 mt-1">Human-in-the-Loop</div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+        <div class="text-xs text-slate-400 font-medium">DLP High/Med Scans</div>
+        <div id="stat-dlp" class="text-2xl font-bold text-rose-400 mt-1">--</div>
+        <div class="text-xs text-rose-500/80 mt-1">Secrets detected</div>
+      </div>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <div class="border-b border-slate-800">
+      <nav class="flex space-x-6 text-sm font-medium">
+        <button onclick="switchTab('tab-approvals')" id="btn-tab-approvals" class="tab-btn pb-3 text-emerald-400 border-b-2 border-emerald-400 flex items-center gap-2">
+          <span>Pending Approvals</span>
+          <span id="badge-tab-pending" class="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-400 text-xs hidden">0</span>
+        </button>
+        <button onclick="switchTab('tab-models')" id="btn-tab-models" class="tab-btn pb-3 text-slate-400 hover:text-slate-200 border-b-2 border-transparent">
+          Models Pool
+        </button>
+        <button onclick="switchTab('tab-dlp')" id="btn-tab-dlp" class="tab-btn pb-3 text-slate-400 hover:text-slate-200 border-b-2 border-transparent">
+          DLP Audit Logs
+        </button>
+        <button onclick="switchTab('tab-quotas')" id="btn-tab-quotas" class="tab-btn pb-3 text-slate-400 hover:text-slate-200 border-b-2 border-transparent">
+          Provider Quotas & Cooldowns
+        </button>
+      </nav>
+    </div>
+
+    <!-- TAB 1: PENDING APPROVALS -->
+    <div id="tab-approvals" class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold text-white">Pending Requests (Human-in-the-Loop Approval Gate)</h2>
+        <span class="text-xs text-slate-400">Medium/High-risk sensitive data requires your review</span>
+      </div>
+
+      <div id="approvals-container" class="space-y-3">
+        <!-- Rendered dynamically -->
+        <div class="p-8 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl">
+          No pending approvals at the moment. All requests are cleared.
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: MODELS POOL -->
+    <div id="tab-models" class="hidden space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold text-white">Discovered Free-Tier Models Pool</h2>
+        <span class="text-xs text-slate-400">Models with $0 pricing or ':free' tag</span>
+      </div>
+
+      <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded-xl shadow">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-slate-950/50 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="px-4 py-3">Model ID / Name</th>
+              <th class="px-4 py-3">Provider</th>
+              <th class="px-4 py-3">Context Window</th>
+              <th class="px-4 py-3">Latency</th>
+              <th class="px-4 py-3">Health / Status</th>
+            </tr>
+          </thead>
+          <tbody id="models-table-body" class="divide-y divide-slate-800">
+            <!-- Rendered dynamically -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- TAB 3: DLP AUDIT LOGS -->
+    <div id="tab-dlp" class="hidden space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold text-white">Zero-Trust DLP Audit Logs</h2>
+        <span class="text-xs text-slate-400">All offline redaction and policy enforcement records</span>
+      </div>
+
+      <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded-xl shadow">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-slate-950/50 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="px-4 py-3">Timestamp</th>
+              <th class="px-4 py-3">Risk Level</th>
+              <th class="px-4 py-3">Action Taken</th>
+              <th class="px-4 py-3">Redactions</th>
+              <th class="px-4 py-3">Detected Rules</th>
+              <th class="px-4 py-3">Client IP</th>
+            </tr>
+          </thead>
+          <tbody id="dlp-table-body" class="divide-y divide-slate-800">
+            <!-- Rendered dynamically -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- TAB 4: PROVIDER QUOTAS & COOLDOWNS -->
+    <div id="tab-quotas" class="hidden space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold text-white">Provider Status & 429 Cooldown Tracker</h2>
+        <span class="text-xs text-slate-400">Auto-routes away when cooldown is active</span>
+      </div>
+
+      <div id="quotas-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Notification Toast -->
+  <div id="toast" class="fixed bottom-4 right-4 bg-emerald-600 text-white px-4 py-2.5 rounded-lg shadow-xl text-sm font-medium transition-all transform translate-y-20 opacity-0 pointer-events-none z-50 flex items-center space-x-2">
+    <span id="toast-message">Action successful</span>
+  </div>
+
+  <script>
+    let currentTab = 'tab-approvals';
+
+    function showToast(msg, isError = false) {
+      const toast = document.getElementById('toast');
+      const text = document.getElementById('toast-message');
+      text.innerText = msg;
+      toast.className = `fixed bottom-4 right-4 px-4 py-2.5 rounded-lg shadow-xl text-sm font-medium transition-all transform translate-y-0 opacity-100 z-50 flex items-center space-x-2 ${isError ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'}`;
+      setTimeout(() => {
+        toast.className = toast.className.replace('translate-y-0 opacity-100', 'translate-y-20 opacity-0 pointer-events-none');
+      }, 3000);
+    }
+
+    function switchTab(tabId) {
+      currentTab = tabId;
+      ['tab-approvals', 'tab-models', 'tab-dlp', 'tab-quotas'].forEach(id => {
+        const el = document.getElementById(id);
+        const btn = document.getElementById('btn-' + id);
+        if (id === tabId) {
+          el.classList.remove('hidden');
+          btn.className = 'tab-btn pb-3 text-emerald-400 border-b-2 border-emerald-400 flex items-center gap-2';
+        } else {
+          el.classList.add('hidden');
+          btn.className = 'tab-btn pb-3 text-slate-400 hover:text-slate-200 border-b-2 border-transparent flex items-center gap-2';
+        }
+      });
+    }
+
+    async function fetchStats() {
+      try {
+        const res = await fetch('/api/stats');
+        if (!res.ok) return;
+        const d = await res.json();
+        document.getElementById('stat-models').innerText = d.total_active_models || 0;
+        document.getElementById('stat-requests').innerText = d.total_requests_today || 0;
+        document.getElementById('stat-tokens').innerText = (d.total_tokens_today || 0).toLocaleString();
+        document.getElementById('stat-pending').innerText = d.pending_approvals_count || 0;
+        document.getElementById('stat-dlp').innerText = d.dlp_incidents_count || 0;
+
+        const badge = document.getElementById('badge-tab-pending');
+        if (d.pending_approvals_count > 0) {
+          badge.innerText = d.pending_approvals_count;
+          badge.classList.remove('hidden');
+        } else {
+          badge.classList.add('hidden');
+        }
+      } catch (err) {
+        console.error("Failed to load stats", err);
+      }
+    }
+
+    async function fetchApprovals() {
+      try {
+        const res = await fetch('/api/approvals/pending');
+        if (!res.ok) return;
+        const items = await res.json();
+        const container = document.getElementById('approvals-container');
+
+        if (!items || items.length === 0) {
+          container.innerHTML = `
+            <div class="p-8 text-center text-slate-500 bg-slate-900 border border-slate-800 rounded-xl">
+              No pending approvals at the moment. All requests are cleared.
+            </div>
+          `;
+          return;
+        }
+
+        container.innerHTML = items.map(item => {
+          const findingsList = (item.findings || []).map(f => `
+            <li class="text-xs flex items-center justify-between py-1 border-b border-slate-800 last:border-none">
+              <span class="text-slate-300 font-mono"><strong class="text-amber-400">${f.rule_name}</strong> (${f.entity_type}): <code class="bg-slate-800 px-1 py-0.5 rounded text-emerald-400">${f.redacted_token}</code></span>
+              <span class="text-slate-500 font-mono text-xs">Masked: ${f.masked_value}</span>
+            </li>
+          `).join('');
+
+          return `
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-3">
+                  <span class="badge ${item.risk_level === 'HIGH' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'}">
+                    ${item.risk_level} RISK
+                  </span>
+                  <span class="text-sm font-semibold text-white">Model: ${item.model_requested}</span>
+                  <span class="text-xs text-slate-500">Client: ${item.client_ip}</span>
+                </div>
+                <div class="text-xs text-slate-500 font-mono">ID: ${item.id.slice(0, 8)}...</div>
+              </div>
+
+              <div class="bg-slate-950/60 rounded-lg p-3 border border-slate-800">
+                <div class="text-xs font-medium text-slate-400 mb-2">Detected Sensitive Elements:</div>
+                <ul class="space-y-1">
+                  ${findingsList || '<li class="text-xs text-slate-500">No rule details available</li>'}
+                </ul>
+              </div>
+
+              <div class="flex items-center justify-end space-x-3 pt-1">
+                <button onclick="submitDecision('${item.id}', 'rejected')" class="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 text-xs font-semibold rounded-lg border border-rose-500/30 transition">
+                  Reject Request
+                </button>
+                <button onclick="submitDecision('${item.id}', 'approved')" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-slate-950 text-xs font-semibold rounded-lg shadow-md shadow-emerald-500/20 transition">
+                  Approve (Forward Sanitized)
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('');
+
+      } catch (err) {
+        console.error("Failed to load approvals", err);
+      }
+    }
+
+    async function submitDecision(id, decision) {
+      try {
+        const res = await fetch(`/api/approvals/${id}/decision`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`Request ${decision.toUpperCase()} successfully`);
+          fetchApprovals();
+          fetchStats();
+        } else {
+          showToast(data.detail || 'Failed to submit decision', true);
+        }
+      } catch (err) {
+        showToast('Error communicating with server', true);
+      }
+    }
+
+    async function fetchModels() {
+      try {
+        const res = await fetch('/api/models');
+        if (!res.ok) return;
+        const models = await res.json();
+        const tbody = document.getElementById('models-table-body');
+
+        if (!models || models.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="5" class="px-4 py-6 text-center text-slate-500">No free models harvested yet. Click "Harvest Now" above.</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = models.map(m => `
+          <tr class="hover:bg-slate-800/40 transition">
+            <td class="px-4 py-3">
+              <div class="font-medium text-white">${m.display_name || m.model_name}</div>
+              <div class="text-xs font-mono text-slate-500">${m.id}</div>
+            </td>
+            <td class="px-4 py-3">
+              <span class="badge bg-slate-800 text-slate-300 border border-slate-700 capitalize">${m.provider}</span>
+            </td>
+            <td class="px-4 py-3 text-slate-400 text-xs font-mono">
+              ${(m.context_length || 128000).toLocaleString()} tokens
+            </td>
+            <td class="px-4 py-3 text-slate-400 text-xs">
+              <span class="font-mono text-emerald-400">${Math.round(m.latency_ms || 0)}ms</span>
+            </td>
+            <td class="px-4 py-3">
+              <span class="inline-flex items-center gap-1.5 text-xs text-emerald-400">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                Active ($0)
+              </span>
+            </td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        console.error("Failed to load models", err);
+      }
+    }
+
+    async function fetchDlpLogs() {
+      try {
+        const res = await fetch('/api/dlp/logs?limit=30');
+        if (!res.ok) return;
+        const logs = await res.json();
+        const tbody = document.getElementById('dlp-table-body');
+
+        if (!logs || logs.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-6 text-center text-slate-500">No DLP logs recorded yet.</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = logs.map(l => {
+          const rules = (l.findings || []).map(f => f.rule_name).join(', ') || 'None';
+          const riskColor = l.risk_level === 'HIGH' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' :
+                           l.risk_level === 'MEDIUM' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' :
+                           'bg-slate-800 text-slate-400';
+
+          return `
+            <tr class="hover:bg-slate-800/40 transition">
+              <td class="px-4 py-3 text-xs text-slate-400 font-mono whitespace-nowrap">
+                ${new Date(l.timestamp).toLocaleTimeString()}
+              </td>
+              <td class="px-4 py-3">
+                <span class="badge ${riskColor}">${l.risk_level}</span>
+              </td>
+              <td class="px-4 py-3 text-xs font-semibold text-slate-200">
+                ${l.action_taken}
+              </td>
+              <td class="px-4 py-3 text-xs text-slate-400 font-mono">
+                ${l.redaction_count} entities
+              </td>
+              <td class="px-4 py-3 text-xs text-slate-300 max-w-xs truncate" title="${rules}">
+                ${rules}
+              </td>
+              <td class="px-4 py-3 text-xs font-mono text-slate-500">
+                ${l.client_ip}
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error("Failed to load DLP logs", err);
+      }
+    }
+
+    async function fetchQuotas() {
+      try {
+        const res = await fetch('/api/quotas');
+        if (!res.ok) return;
+        const quotas = await res.json();
+        const container = document.getElementById('quotas-container');
+
+        if (!quotas || quotas.length === 0) {
+          container.innerHTML = `<div class="col-span-4 text-center py-6 text-slate-500">No quota records.</div>`;
+          return;
+        }
+
+        container.innerHTML = quotas.map(q => {
+          const isCooldown = q.in_cooldown;
+          return `
+            <div class="bg-slate-900 border ${isCooldown ? 'border-rose-500/40' : 'border-slate-800'} rounded-xl p-4 shadow-sm space-y-3">
+              <div class="flex items-center justify-between">
+                <span class="text-sm font-bold text-white capitalize">${q.provider}</span>
+                <span class="badge ${isCooldown ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'}">
+                  ${isCooldown ? '429 Cooldown' : 'Healthy'}
+                </span>
+              </div>
+              <div class="space-y-1 text-xs text-slate-400">
+                <div class="flex justify-between"><span>Requests Today:</span> <strong class="text-white font-mono">${q.requests_today}</strong></div>
+                <div class="flex justify-between"><span>Tokens Processed:</span> <strong class="text-white font-mono">${(q.tokens_today || 0).toLocaleString()}</strong></div>
+                ${isCooldown ? `<div class="flex justify-between text-rose-400"><span>Cooldown remaining:</span> <strong>${q.cooldown_remaining_sec}s</strong></div>` : ''}
+              </div>
+              ${q.last_error_message ? `<div class="text-xs text-rose-400/80 bg-rose-500/10 p-2 rounded truncate" title="${q.last_error_message}">Error: ${q.last_error_message}</div>` : ''}
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error("Failed to load quotas", err);
+      }
+    }
+
+    async function triggerHarvest() {
+      const btn = document.getElementById('btn-harvest');
+      btn.classList.add('opacity-50', 'pointer-events-none');
+      try {
+        const res = await fetch('/api/harvester/trigger', { method: 'POST' });
+        const d = await res.json();
+        showToast(`Harvest complete: Discovered ${d.openrouter_discovered} OpenRouter free models!`);
+        fetchModels();
+        fetchStats();
+      } catch (err) {
+        showToast('Harvest trigger failed', true);
+      } finally {
+        btn.classList.remove('opacity-50', 'pointer-events-none');
+      }
+    }
+
+    // Refresh cycle
+    function refreshAll() {
+      fetchStats();
+      if (currentTab === 'tab-approvals') fetchApprovals();
+      if (currentTab === 'tab-models') fetchModels();
+      if (currentTab === 'tab-dlp') fetchDlpLogs();
+      if (currentTab === 'tab-quotas') fetchQuotas();
+    }
+
+    // Initial load
+    refreshAll();
+    // Poll every 3 seconds
+    setInterval(refreshAll, 3000);
+  </script>
+</body>
+</html>
