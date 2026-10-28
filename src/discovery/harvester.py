@@ -64,6 +64,48 @@ class ModelHarvester:
 
         return count
 
+    async def harvest_groq(self) -> int:
+        """Query Groq API for currently active models for this API key."""
+        api_key = get_provider_api_key("groq", self.config)
+        if not api_key:
+            return 0
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"}
+            response = await self.egress.get("https://api.groq.com/openai/v1/models", headers=headers)
+            if response.status_code != 200:
+                return 0
+            data = response.json()
+            models_list = data.get("data", [])
+            count = 0
+            for m in models_list:
+                m_id = m.get("id", "")
+                if not m_id:
+                    continue
+                m_lower = m_id.lower()
+                if any(x in m_lower for x in ["whisper", "guard", "orpheus", "allam", "vision", "tts"]):
+                    continue
+                model_entry = {
+                    "id": f"groq/{m_id}",
+                    "provider": "groq",
+                    "model_name": m_id,
+                    "display_name": f"Groq - {m_id}",
+                    "context_length": 128000,
+                    "is_free": True,
+                    "is_active": True,
+                    "latency_ms": 60.0,
+                }
+                await storage_db.upsert_model(self.db_path, model_entry)
+                count += 1
+                alias_entry = dict(model_entry)
+                alias_entry["id"] = m_id
+                alias_entry["display_name"] = f"{m_id} (via groq)"
+                await storage_db.upsert_model(self.db_path, alias_entry)
+            logger.info(f"Successfully harvested {count} active models from Groq.")
+            return count
+        except Exception as e:
+            logger.warning(f"Error harvesting Groq models: {e}")
+            return 0
+
     async def harvest_openrouter(self) -> int:
         """
         Query OpenRouter API for 0$ / ':free' models.
@@ -140,6 +182,7 @@ class ModelHarvester:
         self.is_harvesting = True
         try:
             static_count = await self.register_static_free_models()
+            groq_count = await self.harvest_groq()
             openrouter_count = 0
             if self.config.harvester.auto_discover_openrouter:
                 openrouter_count = await self.harvest_openrouter()
@@ -148,6 +191,7 @@ class ModelHarvester:
             return {
                 "status": "success",
                 "static_models_registered": static_count,
+                "groq_discovered": groq_count,
                 "openrouter_discovered": openrouter_count,
                 "timestamp": self.last_harvest_time,
             }

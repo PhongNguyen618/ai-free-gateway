@@ -68,6 +68,13 @@ class ModelBalancer:
         # Case 1: Exact model requested
         clean_req = requested_model.strip()
         matched = None
+
+        # Check configured API keys
+        configured_providers = set()
+        for p_name in ["openrouter", "groq", "gemini", "github"]:
+            if get_provider_api_key(p_name, self.config):
+                configured_providers.add(p_name)
+
         for m in available_models:
             if m["id"] == clean_req or m["model_name"] == clean_req:
                 matched = m
@@ -88,6 +95,14 @@ class ModelBalancer:
                 continue
 
             score = 100.0
+
+            # Strongly prioritize providers with configured API keys
+            if m["provider"] in configured_providers:
+                score += 300.0
+            elif configured_providers:
+                # Deprioritize providers without keys
+                score -= 100.0
+
             name_lower = m["model_name"].lower()
 
             # Task affinity scoring

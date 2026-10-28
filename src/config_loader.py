@@ -151,4 +151,5 @@ def get_provider_api_key(provider_name: str, config: AppConfig) -> str:
     api_key_env = provider_info.get("api_key_env", "")
     if not api_key_env:
         return ""
-    return os.getenv(api_key_env, "").strip()
+    val = os.getenv(api_key_env, "").strip()
+    return val.strip('"').strip("'")

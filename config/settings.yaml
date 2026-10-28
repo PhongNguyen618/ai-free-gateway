@@ -45,6 +45,12 @@ providers:
     api_key_env: "GROQ_API_KEY"
     cooldown_seconds_on_429: 300
     static_free_models:
+      - id: "qwen/qwen3.8-27b"
+        context_length: 128000
+      - id: "openai/gpt-oss-120b"
+        context_length: 128000
+      - id: "openai/gpt-oss-20b"
+        context_length: 128000
       - id: "llama-3.3-70b-versatile"
         context_length: 128000
       - id: "llama-3.1-8b-instant"
@@ -85,6 +91,7 @@ harvester:
   auto_discover_openrouter: true
   health_check_interval_seconds: 600
   default_fallback_models:
-    - "groq/llama-3.3-70b-versatile"
+    - "groq/qwen/qwen3.8-27b"
+    - "groq/openai/gpt-oss-120b"
     - "openrouter/auto"
     - "gemini/gemini-1.5-flash"
