@@ -41,6 +41,96 @@ class ModelBalancer:
 
         return "general"
 
+    def evaluate_model_intelligence(
+        self, model_name: str, context_length: int = 128000, task_type: str = "general"
+    ) -> float:
+        """
+        Dynamically evaluate any model's intelligence, parameter size, and capability
+        purely from metadata and heuristics WITHOUT requiring hardcoded list entries.
+        Automatically recognizes new models harvested from OpenRouter/Groq/Gemini.
+        """
+        score = 0.0
+        name_lower = model_name.lower()
+
+        # 1. Automatic Parameter Size Extraction via Regex (e.g. 70b, 120b, 72b, 32b, 8b, 405b, 671b)
+        # Check MoE patterns first (e.g. 8x7b, 8x22b)
+        moe_match = re.search(r"(\d+)x(\d+(?:\.\d+)?)b", name_lower)
+        if moe_match:
+            experts = int(moe_match.group(1))
+            size = float(moe_match.group(2))
+            total_active = experts * size
+            if total_active >= 100:
+                score += 320.0
+            elif total_active >= 40:
+                score += 220.0
+            else:
+                score += 150.0
+        else:
+            # Regular parameter size matching
+            b_matches = re.findall(r"(?:^|[^\w])(\d+(?:\.\d+)?)b(?:[^\w]|$)", name_lower)
+            if b_matches:
+                try:
+                    sizes = [float(val) for val in b_matches]
+                    max_b = max(sizes)
+                    if max_b >= 100:      # 120B, 405B, 671B
+                        score += 350.0
+                    elif max_b >= 60:     # 70B, 72B
+                        score += 270.0
+                    elif max_b >= 25:     # 27B, 32B
+                        score += 180.0
+                    elif max_b >= 12:     # 14B, 16B
+                        score += 120.0
+                    elif max_b >= 6:      # 7B, 8B, 9B
+                        score += 60.0
+                    else:                 # 1.5B, 3B
+                        score += 15.0
+                except Exception:
+                    pass
+
+        # 2. Top-tier Model Family & Lab reputation boosts
+        if "deepseek" in name_lower:
+            score += 120.0
+        if "qwen" in name_lower:
+            score += 110.0
+        if "llama-3" in name_lower or "llama3" in name_lower:
+            score += 100.0
+        if "gemini-2" in name_lower or "gemini-1.5-pro" in name_lower:
+            score += 110.0
+        elif "gemini" in name_lower:
+            score += 80.0
+        if "gpt-4" in name_lower or "gpt-oss" in name_lower:
+            score += 110.0
+        if "claude" in name_lower:
+            score += 120.0
+        if "mistral" in name_lower or "mixtral" in name_lower:
+            score += 90.0
+
+        # 3. Reasoning & Chain-of-Thought (CoT) specialists
+        if any(term in name_lower for term in ["r1", "reason", "o1", "thought"]):
+            score += 120.0
+
+        # 4. Coding Specialists
+        if any(term in name_lower for term in ["coder", "coding", "starcoder"]):
+            score += 130.0
+
+        # 5. Task-specific matching boost
+        if task_type == "code":
+            if any(term in name_lower for k in ["code", "coder", "deepseek", "qwen", "llama-3"] if k == term):
+                score += 80.0
+        elif task_type == "reasoning":
+            if any(term in name_lower for k in ["r1", "reason", "120b", "70b", "gemini-2"] if k == term):
+                score += 80.0
+
+        # 6. Context Window capacity (useful for reading whole codebases)
+        if context_length >= 1000000:
+            score += 120.0
+        elif context_length >= 128000:
+            score += 70.0
+        elif context_length >= 32000:
+            score += 40.0
+
+        return score
+
     async def get_candidate_chain(
         self,
         requested_model: str,
@@ -99,7 +189,6 @@ class ModelBalancer:
                 continue
 
             score = 100.0
-            name_lower = m["model_name"].lower()
 
             # 1. Strongly prioritize providers with configured API keys
             if m["provider"] in configured_providers:
@@ -107,40 +196,17 @@ class ModelBalancer:
             elif configured_providers:
                 score -= 500.0
 
-            # 2. Priority List rank boost (User-configured tier order)
+            # 2. Dynamic Intelligence Evaluation (Parameters, Architecture, MoE, Coding, Context)
+            context_len = m.get("context_length", 128000)
+            score += self.evaluate_model_intelligence(m["model_name"], context_len, task_type)
+
+            # 3. User-defined Priority List rank boost (Optional manual override)
             for rank_idx, p_id in enumerate(priority_models):
                 if m["id"] == p_id or m["model_name"] == p_id or m["id"].endswith("/" + p_id):
-                    score += (len(priority_models) - rank_idx) * 150.0
+                    score += (len(priority_models) - rank_idx) * 80.0
                     break
 
-            # 3. Model Architecture & Parameter Size Tier boost (120B > 70B > 32B/27B > 8B)
-            if "120b" in name_lower:
-                score += 250.0
-            elif "70b" in name_lower:
-                score += 200.0
-            elif "32b" in name_lower or "27b" in name_lower or "qwen3.8" in name_lower:
-                score += 160.0
-            elif "8b" in name_lower or "7b" in name_lower:
-                score += 50.0
-
-            # 4. Specialized capabilities (Coding & Reasoning)
-            if "coder" in name_lower or "deepseek" in name_lower:
-                score += 120.0
-            if "r1" in name_lower or "reason" in name_lower:
-                score += 110.0
-
-            # 5. Task affinity scoring
-            if task_type == "code":
-                if any(k in name_lower for k in ["code", "deepseek", "llama-3.3", "qwen", "120b"]):
-                    score += 80.0
-            elif task_type == "reasoning":
-                if any(k in name_lower for k in ["r1", "reason", "120b", "70b", "gemini-2.0"]):
-                    score += 80.0
-
-            # 6. Context Window & Latency weighting
-            context_len = m.get("context_length", 128000)
-            score += min(100.0, context_len / 10000.0)
-
+            # 4. Latency & health weighting
             latency = float(m.get("latency_ms", 200.0) or 200.0)
             score += max(0.0, 300.0 / (latency + 1.0))
 
