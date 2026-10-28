@@ -115,10 +115,10 @@ class ModelBalancer:
 
         # 5. Task-specific matching boost
         if task_type == "code":
-            if any(term in name_lower for k in ["code", "coder", "deepseek", "qwen", "llama-3"] if k == term):
+            if any(term in name_lower for term in ["code", "coder", "deepseek", "qwen", "llama-3"]):
                 score += 80.0
         elif task_type == "reasoning":
-            if any(term in name_lower for k in ["r1", "reason", "120b", "70b", "gemini-2"] if k == term):
+            if any(term in name_lower for term in ["r1", "reason", "120b", "70b", "gemini-2"]):
                 score += 80.0
 
         # 6. Context Window capacity (useful for reading whole codebases)
