@@ -84,9 +84,23 @@ class HarvesterConfig(BaseModel):
     poll_interval_seconds: int = Field(default=300)
     auto_discover_openrouter: bool = Field(default=True)
     health_check_interval_seconds: int = Field(default=600)
+    priority_models: List[str] = Field(
+        default_factory=lambda: [
+            "groq/openai/gpt-oss-120b",
+            "groq/qwen/qwen3.8-27b",
+            "openrouter/deepseek/deepseek-r1:free",
+            "openrouter/qwen/qwen-2.5-coder-32b-instruct:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "gemini/gemini-2.0-flash-exp",
+            "gemini/gemini-1.5-flash",
+            "groq/openai/gpt-oss-20b",
+            "groq/llama-3.1-8b-instant",
+        ]
+    )
     default_fallback_models: List[str] = Field(
         default_factory=lambda: [
-            "groq/llama-3.3-70b-versatile",
+            "groq/openai/gpt-oss-120b",
+            "groq/qwen/qwen3.8-27b",
             "openrouter/auto",
             "gemini/gemini-1.5-flash",
         ]

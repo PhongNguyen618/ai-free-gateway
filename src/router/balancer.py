@@ -65,8 +65,9 @@ class ModelBalancer:
             m for m in all_models if m["provider"] not in cooldown_providers
         ]
 
-        # Case 1: Exact model requested
+        # Case 1: Exact model requested (bypass auto-tier scoring only if specific model is requested)
         clean_req = requested_model.strip()
+        is_auto_mode = clean_req.lower() in ("auto", "default", "best", "free", "")
         matched = None
 
         # Check configured API keys
@@ -75,17 +76,20 @@ class ModelBalancer:
             if get_provider_api_key(p_name, self.config):
                 configured_providers.add(p_name)
 
-        for m in available_models:
-            if m["id"] == clean_req or m["model_name"] == clean_req:
-                matched = m
-                break
+        if not is_auto_mode:
+            for m in available_models:
+                if m["id"] == clean_req or m["model_name"] == clean_req:
+                    matched = m
+                    break
 
         candidates: List[Dict[str, Any]] = []
         if matched:
             candidates.append(matched)
 
-        # Build prioritized fallback list
+        # Build prioritized fallback list using Tier & Capability scoring
+        priority_models = getattr(self.config.harvester, "priority_models", [])
         scored_candidates: List[Tuple[float, Dict[str, Any]]] = []
+
         for m in available_models:
             if matched and m["id"] == matched["id"]:
                 continue
@@ -95,30 +99,53 @@ class ModelBalancer:
                 continue
 
             score = 100.0
-
-            # Strongly prioritize providers with configured API keys
-            if m["provider"] in configured_providers:
-                score += 300.0
-            elif configured_providers:
-                # Deprioritize providers without keys
-                score -= 100.0
-
             name_lower = m["model_name"].lower()
 
-            # Task affinity scoring
-            if task_type == "code":
-                if any(k in name_lower for k in ["code", "deepseek", "llama-3.3", "qwen"]):
-                    score += 50.0
-            elif task_type == "reasoning":
-                if any(k in name_lower for k in ["r1", "reason", "70b", "gemini-2.0"]):
-                    score += 60.0
+            # 1. Strongly prioritize providers with configured API keys
+            if m["provider"] in configured_providers:
+                score += 500.0
+            elif configured_providers:
+                score -= 500.0
 
-            # Latency and health weighting
+            # 2. Priority List rank boost (User-configured tier order)
+            for rank_idx, p_id in enumerate(priority_models):
+                if m["id"] == p_id or m["model_name"] == p_id or m["id"].endswith("/" + p_id):
+                    score += (len(priority_models) - rank_idx) * 150.0
+                    break
+
+            # 3. Model Architecture & Parameter Size Tier boost (120B > 70B > 32B/27B > 8B)
+            if "120b" in name_lower:
+                score += 250.0
+            elif "70b" in name_lower:
+                score += 200.0
+            elif "32b" in name_lower or "27b" in name_lower or "qwen3.8" in name_lower:
+                score += 160.0
+            elif "8b" in name_lower or "7b" in name_lower:
+                score += 50.0
+
+            # 4. Specialized capabilities (Coding & Reasoning)
+            if "coder" in name_lower or "deepseek" in name_lower:
+                score += 120.0
+            if "r1" in name_lower or "reason" in name_lower:
+                score += 110.0
+
+            # 5. Task affinity scoring
+            if task_type == "code":
+                if any(k in name_lower for k in ["code", "deepseek", "llama-3.3", "qwen", "120b"]):
+                    score += 80.0
+            elif task_type == "reasoning":
+                if any(k in name_lower for k in ["r1", "reason", "120b", "70b", "gemini-2.0"]):
+                    score += 80.0
+
+            # 6. Context Window & Latency weighting
+            context_len = m.get("context_length", 128000)
+            score += min(100.0, context_len / 10000.0)
+
             latency = float(m.get("latency_ms", 200.0) or 200.0)
-            score += max(0.0, 500.0 / (latency + 1.0))
+            score += max(0.0, 300.0 / (latency + 1.0))
 
             errors = int(m.get("error_count", 0))
-            score -= (errors * 15.0)
+            score -= (errors * 20.0)
 
             scored_candidates.append((score, m))
 
