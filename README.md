@@ -55,7 +55,14 @@ ai-free-gateway/
 
 ## 🚀 Hướng Dẫn Cài Đặt & Sử Dụng
 
-### 1. Cài đặt môi trường
+### 1. Khởi chạy nhanh 1-Click trên Windows
+Dự án đã có sẵn các script tự động hóa:
+- **`start.bat`**: Nhấp đúp để tự động kiểm tra Python, tạo `.venv`, cài đặt `requirements.txt` nếu thiếu và chạy server có cửa sổ giao diện dòng lệnh.
+- **`install_autostart.bat`**: Nhấp đúp để đăng ký **khởi động cùng Windows (chạy ngầm hoàn toàn)**.
+- **`stop.bat`**: Nhấp đúp để dừng tiến trình gateway đang chạy ngầm trên cổng 8000.
+- **`uninstall_autostart.bat`**: Nhấp đúp để hủy tự động khởi động cùng Windows.
+
+### 2. Cài đặt thủ công
 Yêu cầu Python 3.11+.
 
 ```bash
