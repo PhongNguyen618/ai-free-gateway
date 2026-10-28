@@ -19,6 +19,133 @@ class ModelBalancer:
     def __init__(self, config: AppConfig):
         self.config = config
         self.db_path = config.db_path
+        self.last_active_model: Optional[Dict[str, Any]] = None
+        self.last_fallback_chain: List[Dict[str, Any]] = []
+        self.last_routed_at: Optional[str] = None
+        self.total_routed_requests: int = 0
+
+    def record_active_model(
+        self,
+        candidate: Dict[str, Any],
+        full_chain: List[Dict[str, Any]],
+        failed_attempts: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """
+        Record the currently active model serving requests and the real-time fallback sequence.
+        """
+        from datetime import datetime, timezone
+        now_str = datetime.now(timezone.utc).isoformat()
+
+        self.last_active_model = {
+            "id": candidate.get("id"),
+            "model_name": candidate.get("model_name"),
+            "display_name": candidate.get("display_name") or candidate.get("model_name"),
+            "provider": candidate.get("provider"),
+            "context_length": candidate.get("context_length", 128000),
+            "latency_ms": round(float(candidate.get("latency_ms", 0.0) or 0.0), 1),
+            "last_used_at": now_str,
+            "status": "ACTIVE",
+            "failed_attempts": failed_attempts or [],
+        }
+
+        # Remaining fallback chain excluding the active model
+        fallbacks = [c for c in full_chain if c.get("id") != candidate.get("id")]
+        self.last_fallback_chain = fallbacks[:5]
+        self.last_routed_at = now_str
+        self.total_routed_requests += 1
+
+    async def get_routing_status(self) -> Dict[str, Any]:
+        """
+        Return the live active model and upcoming fallback models.
+        If no request has occurred yet, dynamically predicts the top candidates for 'auto'.
+        """
+        quota_states = await storage_db.get_all_quota_states(self.db_path)
+        cooldown_map = {
+            q["provider"]: q.get("in_cooldown", False) for q in quota_states
+        }
+        remaining_map = {
+            q["provider"]: q.get("cooldown_remaining_sec", 0) for q in quota_states
+        }
+
+        if self.last_active_model:
+            active = dict(self.last_active_model)
+            active["in_cooldown"] = cooldown_map.get(active["provider"], False)
+            active["cooldown_remaining_sec"] = remaining_map.get(active["provider"], 0)
+
+            chain = []
+            for idx, c in enumerate(self.last_fallback_chain):
+                is_cd = cooldown_map.get(c.get("provider"), False)
+                chain.append({
+                    "rank": idx + 1,
+                    "id": c.get("id"),
+                    "model_name": c.get("model_name"),
+                    "display_name": c.get("display_name") or c.get("model_name"),
+                    "provider": c.get("provider"),
+                    "context_length": c.get("context_length", 128000),
+                    "latency_ms": round(float(c.get("latency_ms", 0.0) or 0.0), 1),
+                    "in_cooldown": is_cd,
+                    "cooldown_remaining_sec": remaining_map.get(c.get("provider"), 0),
+                    "status": "COOLDOWN (429)" if is_cd else "READY",
+                })
+
+            return {
+                "has_served_request": True,
+                "total_routed": self.total_routed_requests,
+                "last_routed_at": self.last_routed_at,
+                "active_model": active,
+                "fallback_chain": chain,
+            }
+
+        # Default / Pre-flight state: Evaluate optimal candidate chain for 'auto'
+        candidates = await self.get_candidate_chain("auto")
+        if candidates:
+            primary = candidates[0]
+            fallbacks = [c for c in candidates[1:] if c.get("id") != primary.get("id")][:5]
+            is_prim_cd = cooldown_map.get(primary.get("provider"), False)
+
+            active = {
+                "id": primary.get("id"),
+                "model_name": primary.get("model_name"),
+                "display_name": primary.get("display_name") or primary.get("model_name"),
+                "provider": primary.get("provider"),
+                "context_length": primary.get("context_length", 128000),
+                "latency_ms": round(float(primary.get("latency_ms", 0.0) or 0.0), 1),
+                "last_used_at": None,
+                "status": "READY (PRIMARY)",
+                "in_cooldown": is_prim_cd,
+                "cooldown_remaining_sec": remaining_map.get(primary.get("provider"), 0),
+                "failed_attempts": [],
+            }
+            chain = []
+            for idx, c in enumerate(fallbacks):
+                is_cd = cooldown_map.get(c.get("provider"), False)
+                chain.append({
+                    "rank": idx + 1,
+                    "id": c.get("id"),
+                    "model_name": c.get("model_name"),
+                    "display_name": c.get("display_name") or c.get("model_name"),
+                    "provider": c.get("provider"),
+                    "context_length": c.get("context_length", 128000),
+                    "latency_ms": round(float(c.get("latency_ms", 0.0) or 0.0), 1),
+                    "in_cooldown": is_cd,
+                    "cooldown_remaining_sec": remaining_map.get(c.get("provider"), 0),
+                    "status": "COOLDOWN (429)" if is_cd else "READY",
+                })
+            return {
+                "has_served_request": False,
+                "total_routed": 0,
+                "last_routed_at": None,
+                "active_model": active,
+                "fallback_chain": chain,
+            }
+
+        return {
+            "has_served_request": False,
+            "total_routed": 0,
+            "last_routed_at": None,
+            "active_model": None,
+            "fallback_chain": [],
+        }
 
     def classify_task(self, prompt_text: str) -> str:
         """Classify task as 'code', 'reasoning', or 'general'."""

@@ -263,6 +263,7 @@ def create_openai_router(
             )
 
         last_error = None
+        failed_attempts = []
 
         # 6. Fallback routing loop
         for candidate in candidates:
@@ -302,12 +303,14 @@ def create_openai_router(
                             config.db_path, candidate["id"], 500.0, False
                         )
                         last_error = f"Stream provider {provider} returned HTTP {e.response.status_code}"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
                         continue
                     except Exception as e:
                         await storage_db.update_model_metrics(
                             config.db_path, candidate["id"], 500.0, False
                         )
                         last_error = f"Stream provider {provider} connection failed: {e}"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
                         continue
 
                     # Chain first_chunk + rest of generator
@@ -318,6 +321,7 @@ def create_openai_router(
                             yield item
 
                     await storage_db.update_model_metrics(config.db_path, candidate["id"], 150.0, True)
+                    balancer.record_active_model(candidate, candidates, failed_attempts)
                     return StreamingResponse(
                         stream_chained_wrapper(first_chunk, stream_gen),
                         media_type="text/event-stream"
@@ -338,6 +342,7 @@ def create_openai_router(
                         config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
                     )
                     last_error = f"Provider {provider} returned 429 Rate Limit"
+                    failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
                     continue
 
                 if resp.status_code >= 400:
@@ -345,12 +350,14 @@ def create_openai_router(
                         config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
                     )
                     last_error = f"Provider {provider} returned HTTP {resp.status_code}: {resp.text}"
+                    failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
                     continue
 
                 # Successful execution
                 resp_json = resp.json()
                 latency_ms = getattr(resp, "latency_ms", 200.0)
                 await storage_db.update_model_metrics(config.db_path, candidate["id"], latency_ms, True)
+                balancer.record_active_model(candidate, candidates, failed_attempts)
 
                 # Extract token usage for quota tracking
                 usage = resp_json.get("usage", {})

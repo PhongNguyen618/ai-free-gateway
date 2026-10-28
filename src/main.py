@@ -142,6 +142,12 @@ async def get_quotas() -> List[Dict[str, Any]]:
     return await storage_db.get_all_quota_states(config.db_path)
 
 
+@app.get("/api/routing/status", tags=["Dashboard"])
+async def get_routing_status() -> Dict[str, Any]:
+    """Retrieve current active model in use and upcoming fallback chain."""
+    return await balancer.get_routing_status()
+
+
 @app.post("/api/harvester/trigger", tags=["Dashboard"])
 async def trigger_harvester() -> Dict[str, Any]:
     """Manually trigger free-tier model discovery."""

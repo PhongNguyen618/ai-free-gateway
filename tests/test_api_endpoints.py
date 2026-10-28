@@ -79,3 +79,15 @@ async def test_dashboard_stats():
         assert "total_active_models" in stats
         assert "dlp_incidents_count" in stats
         assert stats["total_active_models"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_routing_status_endpoint():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/routing/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "active_model" in data
+        assert "fallback_chain" in data
+        assert isinstance(data["fallback_chain"], list)
