@@ -54,6 +54,20 @@ if not exist "config\.env" (
     )
 )
 
+REM 4.5. Kiem tra xem cong 8000 da co tien trinh chay chua
+netstat -ano | findstr :8000 | findstr LISTENING >nul 2>&1
+if %errorlevel% equ 0 (
+    echo.
+    echo ==========================================================
+    echo  [THONG BAO] Gateway DA DANG CHAY tren cong 8000!
+    echo  Ban khong can mo them cua so moi.
+    echo  Hay mo trinh duyet tai: http://127.0.0.1:8000/
+    echo ==========================================================
+    echo.
+    pause
+    exit /b 0
+)
+
 REM 5. Khoi dong server
 echo.
 echo ==========================================================
