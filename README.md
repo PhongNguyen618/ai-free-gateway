@@ -50,16 +50,22 @@ ai-free-gateway/
 ├── requirements.txt
 ├── pytest.ini
 ├── start.bat                    # Script khởi chạy nhanh trên Windows
-└── stop.bat                     # Script dừng an toàn dựa trên PID của Gateway
+├── stop.bat                     # Script dừng an toàn Gateway
+├── update.bat                   # 1-Click tự động cập nhật code mới từ GitHub
+├── install_autostart.bat        # Cài đặt tự động chạy ngầm cùng Windows
+└── uninstall_autostart.bat      # Gỡ bỏ tự động chạy cùng Windows
 ```
 
 ---
 
 ## 🚀 Hướng Dẫn Cài Đặt & Sử Dụng
 
-### 1. Khởi chạy nhanh 1-Click trên Windows
+### 1. Khởi chạy & Quản lý 1-Click trên Windows
 - **`start.bat`**: Nhấp đúp để tự động kiểm tra Python, tạo `.venv`, cài đặt `requirements.txt` nếu thiếu và chạy server.
 - **`stop.bat`**: Nhấp đúp để dừng an toàn gateway dựa trên PID ghi trong `.gateway.pid` (không kill nhầm các ứng dụng khác).
+- **`update.bat`**: Nhấp đúp để tự động kéo code mới nhất từ GitHub (`git pull`), cập nhật thư viện và khởi động lại Gateway.
+- **`install_autostart.bat`**: Tự động cấu hình Gateway chạy ngầm mỗi khi mở máy tính Windows.
+- **`uninstall_autostart.bat`**: Hủy cấu hình tự khởi động cùng Windows.
 
 ### 2. Cài đặt thủ công
 Yêu cầu Python 3.11+.
