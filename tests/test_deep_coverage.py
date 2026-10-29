@@ -266,6 +266,8 @@ async def test_full_hitl_approval_and_rejection_flow():
     Test that medium-risk prompts trigger HITL gate, and admin approval
     allows request to continue or reject properly.
     """
+    app.state.config.dlp.risk_action.medium = "approve"
+    app.state.config.dlp.approval_timeout_action = "reject"
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # 1. Medium-risk prompt: contains internal IP and CCCD

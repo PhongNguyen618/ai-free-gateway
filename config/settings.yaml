@@ -24,11 +24,11 @@ dlp:
     min_length: 20
   risk_action:
     high: "redact"      # reject | approve | redact
-    medium: "approve"   # approve | redact | allow
+    medium: "redact"    # approve | redact | allow
     low: "redact"       # redact | allow
   pseudonymize_reversible: true
   approval_timeout_seconds: 60
-  approval_timeout_action: "reject" # reject | redact
+  approval_timeout_action: "redact" # reject | redact
   redacted_token_format: "<REDACTED_{TYPE}_{INDEX}>"
 
 providers:
