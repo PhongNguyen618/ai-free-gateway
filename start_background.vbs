@@ -6,4 +6,5 @@ scriptDir = FSO.GetParentFolderName(WScript.ScriptFullName)
 WshShell.CurrentDirectory = scriptDir
 
 ' Chay start.bat o che do an hoan toan (window style 0, false = khong can doi)
-WshShell.Run "cmd /c start.bat", 0, False
+batPath = scriptDir & "\start.bat"
+WshShell.Run "cmd.exe /c """ & batPath & """", 0, False
