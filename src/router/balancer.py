@@ -79,6 +79,74 @@ def estimate_payload_tokens(payload: Dict[str, Any]) -> int:
     return input_tokens + max(256, output_reserve)
 
 
+def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 15000) -> List[Dict[str, Any]]:
+    """
+    Ensure total message characters fit comfortably within Groq Free Tier's 8,000 TPM ceiling.
+    Preserves:
+    1. messages[0] if system prompt.
+    2. Latest messages at the end of the array (user prompt and immediate tool context).
+    3. Tool calls and tool responses paired correctly.
+    """
+    if not messages:
+        return messages
+
+    def msg_len(m: Dict[str, Any]) -> int:
+        c = m.get("content")
+        l = len(c) if isinstance(c, str) else 0
+        tc = m.get("tool_calls")
+        if isinstance(tc, list):
+            l += sum(len(json.dumps(t.get("function", {}))) for t in tc if isinstance(t, dict))
+        return l
+
+    total_chars = sum(msg_len(m) for m in messages)
+    if total_chars <= max_chars:
+        return messages
+
+    has_system = (messages[0].get("role") == "system")
+    system_msg = messages[0] if has_system else None
+    working_msgs = messages[1:] if has_system else list(messages)
+
+    sys_len = msg_len(system_msg) if system_msg else 0
+    if sys_len > (max_chars * 0.5) and system_msg and isinstance(system_msg.get("content"), str):
+        c_text = system_msg["content"]
+        system_msg = dict(system_msg)
+        system_msg["content"] = c_text[:int(max_chars * 0.4)] + "\n...[System prompt compressed to fit Groq limit]..."
+        sys_len = msg_len(system_msg)
+
+    remaining_budget = max_chars - sys_len
+
+    kept_reversed: List[Dict[str, Any]] = []
+    current_used = 0
+
+    if working_msgs:
+        last_m = working_msgs[-1]
+        kept_reversed.append(last_m)
+        current_used += msg_len(last_m)
+
+    for m in reversed(working_msgs[:-1]):
+        l = msg_len(m)
+        if current_used + l <= remaining_budget:
+            kept_reversed.append(m)
+            current_used += l
+        else:
+            break
+
+    kept_forward = list(reversed(kept_reversed))
+    while kept_forward and kept_forward[0].get("role") == "tool":
+        kept_forward.pop(0)
+
+    result = []
+    if system_msg:
+        result.append(system_msg)
+    if len(kept_forward) < len(working_msgs):
+        result.append({
+            "role": "system",
+            "content": "[Previous conversation history compressed to fit Groq free tier limit]"
+        })
+    result.extend(kept_forward)
+    return result
+
+
 class ModelBalancer:
     """
     Intelligent Model Balancer & Router.
@@ -506,6 +574,22 @@ class ModelBalancer:
                     cleaned_messages.append(m_copy)
                 else:
                     cleaned_messages.append(m)
+            # For Groq: Auto-prune message history and cap max_tokens to fit Groq Free Tier's 8,000 TPM ceiling
+            if provider == "groq":
+                tools_len = sum(len(json.dumps(t.get("function", {}))) for t in req_payload.get("tools", []) if isinstance(t, dict))
+                avail_chars = max(6000, 15000 - tools_len)
+                cleaned_messages = prune_messages_for_groq(cleaned_messages, max_chars=avail_chars)
+                if "max_tokens" in req_payload and req_payload["max_tokens"] is not None:
+                    try:
+                        req_payload["max_tokens"] = min(2048, int(req_payload["max_tokens"]))
+                    except (ValueError, TypeError):
+                        pass
+                if "max_completion_tokens" in req_payload and req_payload["max_completion_tokens"] is not None:
+                    try:
+                        req_payload["max_completion_tokens"] = min(2048, int(req_payload["max_completion_tokens"]))
+                    except (ValueError, TypeError):
+                        pass
+
             req_payload["messages"] = cleaned_messages
 
         return target_url, headers, req_payload

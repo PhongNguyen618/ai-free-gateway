@@ -641,3 +641,48 @@ async def test_cline_reasoning_content_supported(r2_app_env, monkeypatch):
         # Verify response also restores reasoning_content
         resp_json = resp.json()
         assert resp_json["choices"][0]["message"]["reasoning_content"] == "Thinking process"
+
+
+@pytest.mark.asyncio
+async def test_groq_oversized_messages_auto_pruned(r2_app_env, monkeypatch):
+    """Verify that oversized message histories (> 15,000 chars) are auto-pruned for Groq to fit under the 8,000 TPM limit."""
+    app, config, test_db = r2_app_env
+    egress = app.state.egress_guard
+
+    captured_payload = None
+
+    async def mock_post(url, headers=None, json_data=None, content=None):
+        nonlocal captured_payload
+        captured_payload = json_data
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "Done"}}]
+        })
+
+    monkeypatch.setattr(egress, "post", mock_post)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        huge_history = [
+            {"role": "system", "content": "System prompt: " * 500},
+            {"role": "user", "content": "Old message 1: " * 500},
+            {"role": "assistant", "content": "Old response 1: " * 500},
+            {"role": "user", "content": "Latest query: what is 1+1?"},
+        ]
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "groq/test-model",
+                "messages": huge_history,
+                "max_tokens": 4096,
+            },
+        )
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        assert captured_payload is not None
+        # Max tokens should be capped to 2048 for Groq
+        assert captured_payload["max_tokens"] <= 2048
+        # Messages should be pruned to fit under Groq limit
+        out_msgs = captured_payload["messages"]
+        total_chars = sum(len(m.get("content", "")) for m in out_msgs)
+        assert total_chars < 16000
+        # The latest user message must be preserved
+        assert out_msgs[-1]["content"] == "Latest query: what is 1+1?"
