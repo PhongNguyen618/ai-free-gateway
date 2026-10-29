@@ -232,6 +232,7 @@
         <table>
           <thead>
             <tr>
+              <th style="width: 130px;">Thứ Hạng (Rank)</th>
               <th>Model ID / Name</th>
               <th>Provider</th>
               <th>Context Window (Bộ Nhớ)</th>
@@ -615,6 +616,26 @@
         models.forEach(m => {
           const tr = createEl('tr');
 
+          // Cột 0: Thứ hạng ưu tiên (Rank)
+          const tdRank = createEl('td');
+          const rank = m.priority_rank;
+          if (rank === 1) {
+            tr.style.background = 'rgba(16, 185, 129, 0.08)';
+            const badge = createEl('span', 'badge badge-emerald', '★ #1 Primary');
+            badge.style.fontWeight = '700';
+            tdRank.appendChild(badge);
+          } else if (rank && rank <= 5) {
+            const badge = createEl('span', 'badge badge-cyan', `#${rank} Dự phòng`);
+            tdRank.appendChild(badge);
+          } else if (rank) {
+            const badge = createEl('span', 'badge badge-slate', `#${rank}`);
+            tdRank.appendChild(badge);
+          } else {
+            const badge = createEl('span', 'badge badge-slate', 'Dự phòng phụ');
+            badge.style.opacity = '0.5';
+            tdRank.appendChild(badge);
+          }
+
           // Cột 1: Name & ID
           const tdName = createEl('td');
           const divDisp = createEl('div', '', m.display_name || m.model_name || '');
@@ -677,6 +698,7 @@
           const statBadge = createEl('span', 'badge badge-emerald', `Active (${Math.round(m.latency_ms || 0)}ms)`);
           tdStat.appendChild(statBadge);
 
+          tr.appendChild(tdRank);
           tr.appendChild(tdName);
           tr.appendChild(tdProv);
           tr.appendChild(tdCtx);

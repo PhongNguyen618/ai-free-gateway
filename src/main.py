@@ -196,7 +196,24 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
 
     @app.get("/api/models", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
     async def get_dashboard_models() -> List[Dict[str, Any]]:
-        return await storage_db.get_active_models(config.db_path)
+        all_models = await storage_db.get_active_models(config.db_path)
+        try:
+            candidates = await balancer.get_candidate_chain("auto")
+            candidate_ids = [c["id"] for c in candidates]
+            rank_map = {cid: idx + 1 for idx, cid in enumerate(candidate_ids)}
+
+            def sort_key(m):
+                mid = m.get("id")
+                if mid in rank_map:
+                    return (0, rank_map[mid], float(m.get("latency_ms", 0.0) or 0.0))
+                return (1, int(m.get("error_count", 0) or 0), float(m.get("latency_ms", 0.0) or 0.0))
+
+            sorted_models = sorted(all_models, key=sort_key)
+            for m in sorted_models:
+                m["priority_rank"] = rank_map.get(m.get("id"), None)
+            return sorted_models
+        except Exception:
+            return all_models
 
     @app.get("/api/approvals/pending", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
     async def get_pending_approvals() -> List[Dict[str, Any]]:
