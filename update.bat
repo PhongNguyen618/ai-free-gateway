@@ -50,3 +50,4 @@ echo ==========================================================
 echo.
 echo [*] Dang khoi dong lai Gateway voi code moi...
 start "" "start.bat"
+

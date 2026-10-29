@@ -489,4 +489,23 @@ class ModelBalancer:
         req_payload = dict(payload)
         req_payload["model"] = model_name
 
+        # Sanitize reasoning_effort for upstream compatibility
+        effort = req_payload.get("reasoning_effort")
+        if effort not in ("low", "medium", "high"):
+            req_payload.pop("reasoning_effort", None)
+
+        # Sanitize messages for providers that reject non-standard fields (e.g. Groq, Gemini, GitHub)
+        if provider in ("groq", "gemini", "github"):
+            cleaned_messages = []
+            for m in req_payload.get("messages", []):
+                if isinstance(m, dict):
+                    m_copy = dict(m)
+                    if not m_copy.get("content") and m_copy.get("reasoning_content"):
+                        m_copy["content"] = m_copy.get("reasoning_content")
+                    m_copy.pop("reasoning_content", None)
+                    cleaned_messages.append(m_copy)
+                else:
+                    cleaned_messages.append(m)
+            req_payload["messages"] = cleaned_messages
+
         return target_url, headers, req_payload

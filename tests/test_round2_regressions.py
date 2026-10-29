@@ -623,13 +623,21 @@ async def test_cline_reasoning_content_supported(r2_app_env, monkeypatch):
         ]
         resp = await client.post(
             "/v1/chat/completions",
-            json={"model": "groq/test-model", "messages": history},
+            json={
+                "model": "groq/test-model",
+                "messages": history,
+                "reasoning_effort": "none",
+            },
         )
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
         assert captured_payload is not None
         out_msgs = captured_payload["messages"]
         assert len(out_msgs) == 3
-        assert out_msgs[1].get("reasoning_content") == "2 plus 2 equals 4."
+        # For Groq, reasoning_content must be stripped to prevent Groq HTTP 400 error
+        assert "reasoning_content" not in out_msgs[1]
+        assert out_msgs[1]["content"] == "4"
+        # reasoning_effort: "none" must be stripped to prevent Groq HTTP 400
+        assert "reasoning_effort" not in captured_payload
         # Verify response also restores reasoning_content
         resp_json = resp.json()
         assert resp_json["choices"][0]["message"]["reasoning_content"] == "Thinking process"

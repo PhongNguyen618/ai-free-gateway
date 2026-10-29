@@ -489,8 +489,8 @@ def create_openai_router(
             outgoing_payload["stream_options"] = validated.stream_options
         if validated.response_format is not None:
             outgoing_payload["response_format"] = validated.response_format
-        if validated.reasoning_effort is not None:
-            outgoing_payload["reasoning_effort"] = validated.reasoning_effort
+        if validated.reasoning_effort is not None and validated.reasoning_effort.lower() in ("low", "medium", "high"):
+            outgoing_payload["reasoning_effort"] = validated.reasoning_effort.lower()
 
         # 5. Routing context budget & candidate chain lookup (R2-09)
         estimated_tokens = estimate_payload_tokens(outgoing_payload)
