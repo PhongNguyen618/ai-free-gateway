@@ -559,6 +559,14 @@ def create_openai_router(
                     except StopAsyncIteration:
                         first_chunk = None
                     except httpx.HTTPStatusError as e:
+                        try:
+                            err_body = e.response.text if hasattr(e.response, "text") else str(e)
+                            Path("storage").mkdir(exist_ok=True)
+                            with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
+                                ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] HTTPStatusError {candidate['id']} ({provider}) HTTP {e.response.status_code}:\n{err_body}\n")
+                        except Exception:
+                            pass
+                        logger.error(f"Stream provider {provider} ({candidate['id']}) returned HTTP {e.response.status_code}: {e}")
                         if e.response.status_code == 429:
                             cooldown_providers_in_request.add(provider)
                             cooldown_sec = _extract_cooldown_seconds(e.response, config, provider)
@@ -572,6 +580,13 @@ def create_openai_router(
                         failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
                         continue
                     except Exception as e:
+                        try:
+                            Path("storage").mkdir(exist_ok=True)
+                            with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
+                                ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Exception {candidate['id']} ({provider}) {type(e).__name__}: {e}\n")
+                        except Exception:
+                            pass
+                        logger.error(f"Stream provider {provider} ({candidate['id']}) connection failed: {type(e).__name__}: {e}")
                         await storage_db.update_model_metrics(
                             config.db_path, candidate["id"], 500.0, False
                         )
@@ -619,6 +634,13 @@ def create_openai_router(
                     continue
 
                 if resp.status_code >= 400:
+                    try:
+                        err_body = resp.text if hasattr(resp, "text") else ""
+                        Path("storage").mkdir(exist_ok=True)
+                        with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
+                            ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] JSON HTTP {resp.status_code} {candidate['id']} ({provider}):\n{err_body}\n")
+                    except Exception:
+                        pass
                     await storage_db.update_model_metrics(
                         config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
                     )
