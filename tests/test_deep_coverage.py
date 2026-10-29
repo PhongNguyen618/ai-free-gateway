@@ -54,21 +54,37 @@ def test_sanitizer_vietnamese_cccd_phone_and_urls():
 
 
 def test_sanitizer_multipart_messages():
+    from src.security.sanitizer import UnsupportedModalityError
     sanitizer = DLPSanitizer()
+
+    # 1. Supported multi-part text messages
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "Call me at alice@test.com"},
+                {"type": "text", "text": "Another text part with IP 192.168.1.1"},
+            ]
+        }
+    ]
+    sanitized_msgs, _, findings, reverse_map, max_risk = sanitizer.sanitize_messages(messages)
+    assert len(findings) == 2
+    assert "<REDACTED_EMAIL_1>" in sanitized_msgs[0]["content"][0]["text"]
+    assert "<REDACTED_INTERNAL_IP_1>" in sanitized_msgs[0]["content"][1]["text"]
+
+    # 2. Strict rejection of unsupported binary modalities (image/audio) under Zero-Trust text DLP
+    unsupported_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Look at this:"},
                 {"type": "image_url", "image_url": {"url": "https://example.com/pic.png"}}
             ]
         }
     ]
-    sanitized_msgs, findings, reverse_map, max_risk = sanitizer.sanitize_messages(messages)
-    assert len(findings) == 1
-    assert findings[0].entity_type == "EMAIL"
-    assert "<REDACTED_EMAIL_1>" in sanitized_msgs[0]["content"][0]["text"]
-    assert sanitized_msgs[0]["content"][1]["type"] == "image_url"
+    with pytest.raises(UnsupportedModalityError) as exc_info:
+        sanitizer.sanitize_messages(unsupported_messages)
+    assert "Unsupported modality 'image_url'" in str(exc_info.value)
 
 
 def test_streaming_restorer_edge_cases():
@@ -136,9 +152,9 @@ async def test_egress_guard_payload_limit_and_schemes():
 # =========================================================================
 
 @pytest.mark.asyncio
-async def test_balancer_classification_and_scoring():
+async def test_balancer_classification_and_scoring(tmp_path):
     config = get_config()
-    test_db = "storage/test_balancer.db"
+    test_db = str(tmp_path / "test_balancer.db")
     await storage_db.init_db(test_db)
 
     # Insert test models into DB
@@ -205,9 +221,9 @@ async def test_balancer_classification_and_scoring():
 # =========================================================================
 
 @pytest.mark.asyncio
-async def test_harvester_static_and_openrouter_mock():
+async def test_harvester_static_and_openrouter_mock(tmp_path):
     config = get_config()
-    test_db = "storage/test_harvester.db"
+    test_db = str(tmp_path / "test_harvester.db")
     await storage_db.init_db(test_db)
 
     test_config = config.model_copy()
@@ -350,17 +366,16 @@ def test_custom_blocklist_redaction_and_restoration():
 
 
 @pytest.mark.asyncio
-async def test_streaming_429_failover(monkeypatch):
+async def test_streaming_429_failover(monkeypatch, tmp_path):
     """
     Verify that when stream=True and the first provider (groq) raises
     httpx.HTTPStatusError with status 429, the proxy records cooldown for groq
     and transparently streams the response from the second fallback provider
     (openrouter) with HTTP 200.
     """
-    import time
     from fastapi import FastAPI
     config = get_config()
-    test_db = f"storage/test_stream_429_{int(time.time() * 1000)}.db"
+    test_db = str(tmp_path / "test_stream_429.db")
     await storage_db.init_db(test_db)
 
     await storage_db.upsert_model(test_db, {

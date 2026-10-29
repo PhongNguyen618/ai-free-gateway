@@ -5,12 +5,16 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 import aiosqlite
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def ensure_db_dir(db_path: str) -> None:
@@ -31,7 +35,7 @@ async def get_db(db_path: str) -> AsyncIterator[aiosqlite.Connection]:
 
 
 async def init_db(db_path: str) -> None:
-    """Initialize SQLite tables and indexes."""
+    """Initialize SQLite tables, columns migration, and indexes."""
     async with get_db(db_path) as conn:
         # Table 1: models_pool
         await conn.execute("""
@@ -57,12 +61,25 @@ async def init_db(db_path: str) -> None:
                 provider TEXT PRIMARY KEY,
                 requests_today INTEGER DEFAULT 0,
                 tokens_today INTEGER DEFAULT 0,
+                usage_date TEXT,
                 rate_limited_until TEXT,
                 last_status_code INTEGER DEFAULT 200,
                 last_error_message TEXT,
                 updated_at TEXT NOT NULL
             )
         """)
+
+        # Safe migration for quota_state.usage_date if existing table lacked it
+        cursor = await conn.execute("PRAGMA table_info(quota_state)")
+        cols = [row["name"] for row in await cursor.fetchall()]
+        if "usage_date" not in cols:
+            await conn.execute("ALTER TABLE quota_state ADD COLUMN usage_date TEXT")
+
+        # Safe migration for models_pool.total_tokens
+        cursor_m = await conn.execute("PRAGMA table_info(models_pool)")
+        cols_m = [row["name"] for row in await cursor_m.fetchall()]
+        if "total_tokens" not in cols_m:
+            await conn.execute("ALTER TABLE models_pool ADD COLUMN total_tokens INTEGER DEFAULT 0")
 
         # Table 3: dlp_audit_logs
         await conn.execute("""
@@ -117,6 +134,8 @@ async def upsert_model(db_path: str, model_data: Dict[str, Any]) -> None:
                 is_free, is_active, latency_ms, last_checked_at, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                provider = excluded.provider,
+                model_name = excluded.model_name,
                 display_name = excluded.display_name,
                 context_length = excluded.context_length,
                 is_free = excluded.is_free,
@@ -134,6 +153,28 @@ async def upsert_model(db_path: str, model_data: Dict[str, Any]) -> None:
             now,
             now,
         ))
+        await conn.commit()
+
+
+async def reconcile_active_models(db_path: str, provider: str, active_model_ids: List[str]) -> None:
+    """Deactivate models for a provider that are no longer present in a successful harvest snapshot."""
+    now = _now_iso()
+    async with get_db(db_path) as conn:
+        if not active_model_ids:
+            await conn.execute(
+                "UPDATE models_pool SET is_active = 0, last_checked_at = ? WHERE provider = ?",
+                (now, provider),
+            )
+        else:
+            placeholders = ",".join("?" for _ in active_model_ids)
+            await conn.execute(
+                f"""
+                UPDATE models_pool
+                SET is_active = 0, last_checked_at = ?
+                WHERE provider = ? AND id NOT IN ({placeholders})
+                """,
+                [now, provider] + active_model_ids,
+            )
         await conn.commit()
 
 
@@ -159,7 +200,9 @@ async def get_model_by_id(db_path: str, model_id: str) -> Optional[Dict[str, Any
         return dict(row) if row else None
 
 
-async def update_model_metrics(db_path: str, model_id: str, latency_ms: float, is_success: bool) -> None:
+async def update_model_metrics(
+    db_path: str, model_id: str, latency_ms: float, is_success: bool, tokens_used: int = 0
+) -> None:
     now = _now_iso()
     async with get_db(db_path) as conn:
         if is_success:
@@ -167,9 +210,10 @@ async def update_model_metrics(db_path: str, model_id: str, latency_ms: float, i
                 UPDATE models_pool
                 SET latency_ms = (latency_ms * 0.7 + ? * 0.3),
                     success_count = success_count + 1,
+                    total_tokens = total_tokens + ?,
                     last_checked_at = ?
                 WHERE id = ?
-            """, (latency_ms, now, model_id))
+            """, (latency_ms, max(0, int(tokens_used)), now, model_id))
         else:
             await conn.execute("""
                 UPDATE models_pool
@@ -189,20 +233,22 @@ async def set_provider_cooldown(
     status_code: int = 429,
     error_msg: str = "Rate limit reached"
 ) -> None:
+    """Set provider cooldown without accidentally creating a successful request count."""
     now = datetime.now(timezone.utc)
+    today = _today_utc()
     until = (now + timedelta(seconds=cooldown_seconds)).isoformat()
     async with get_db(db_path) as conn:
         await conn.execute("""
             INSERT INTO quota_state (
-                provider, requests_today, tokens_today, rate_limited_until,
+                provider, requests_today, tokens_today, usage_date, rate_limited_until,
                 last_status_code, last_error_message, updated_at
-            ) VALUES (?, 1, 0, ?, ?, ?, ?)
+            ) VALUES (?, 0, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(provider) DO UPDATE SET
                 rate_limited_until = excluded.rate_limited_until,
                 last_status_code = excluded.last_status_code,
                 last_error_message = excluded.last_error_message,
                 updated_at = excluded.updated_at
-        """, (provider, until, status_code, error_msg, now.isoformat()))
+        """, (provider, today, until, status_code, error_msg, now.isoformat()))
         await conn.commit()
 
 
@@ -224,22 +270,33 @@ async def is_provider_in_cooldown(db_path: str, provider: str) -> bool:
 
 
 async def increment_provider_usage(db_path: str, provider: str, tokens: int = 0) -> None:
-    now = _now_iso()
+    """Atomically increment provider requests & tokens, auto-resetting when crossing UTC midnight."""
+    now_iso = _now_iso()
+    today = _today_utc()
+    toks = max(0, tokens)
     async with get_db(db_path) as conn:
         await conn.execute("""
             INSERT INTO quota_state (
-                provider, requests_today, tokens_today, rate_limited_until,
+                provider, requests_today, tokens_today, usage_date, rate_limited_until,
                 last_status_code, last_error_message, updated_at
-            ) VALUES (?, 1, ?, NULL, 200, NULL, ?)
+            ) VALUES (?, 1, ?, ?, NULL, 200, NULL, ?)
             ON CONFLICT(provider) DO UPDATE SET
-                requests_today = requests_today + 1,
-                tokens_today = tokens_today + excluded.tokens_today,
+                requests_today = CASE
+                    WHEN quota_state.usage_date = excluded.usage_date THEN quota_state.requests_today + 1
+                    ELSE 1
+                END,
+                tokens_today = CASE
+                    WHEN quota_state.usage_date = excluded.usage_date THEN quota_state.tokens_today + excluded.tokens_today
+                    ELSE excluded.tokens_today
+                END,
+                usage_date = excluded.usage_date,
                 updated_at = excluded.updated_at
-        """, (provider, max(0, tokens), now))
+        """, (provider, toks, today, now_iso))
         await conn.commit()
 
 
 async def get_all_quota_states(db_path: str) -> List[Dict[str, Any]]:
+    today = _today_utc()
     async with get_db(db_path) as conn:
         cursor = await conn.execute("SELECT * FROM quota_state ORDER BY provider ASC")
         rows = await cursor.fetchall()
@@ -247,6 +304,10 @@ async def get_all_quota_states(db_path: str) -> List[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         for r in rows:
             d = dict(r)
+            # Normalize display for days other than today
+            if d.get("usage_date") != today:
+                d["requests_today"] = 0
+                d["tokens_today"] = 0
             in_cooldown = False
             cooldown_remaining_sec = 0
             if d.get("rate_limited_until"):
@@ -266,6 +327,18 @@ async def get_all_quota_states(db_path: str) -> List[Dict[str, Any]]:
 # --- DLP Audit Logs ---
 
 async def insert_dlp_log(db_path: str, log_data: Dict[str, Any]) -> int:
+    """Insert sanitized DLP audit record. Never write raw unmasked secrets into audit."""
+    safe_findings = []
+    for f in log_data.get("findings", []):
+        if isinstance(f, dict):
+            safe_findings.append({
+                "rule_name": f.get("rule_name", ""),
+                "entity_type": f.get("entity_type", ""),
+                "risk_level": f.get("risk_level", ""),
+                "redacted_token": f.get("redacted_token", ""),
+                "masked_value": f.get("masked_value", "***"),
+            })
+
     async with get_db(db_path) as conn:
         cursor = await conn.execute("""
             INSERT INTO dlp_audit_logs (
@@ -277,10 +350,10 @@ async def insert_dlp_log(db_path: str, log_data: Dict[str, Any]) -> int:
             log_data.get("client_ip", "127.0.0.1"),
             log_data.get("direction", "request"),
             log_data.get("risk_level", "LOW"),
-            json.dumps(log_data.get("findings", [])),
+            json.dumps(safe_findings),
             log_data.get("redaction_count", 0),
             log_data.get("action_taken", "ALLOWED"),
-            log_data.get("prompt_snippet", "")[:200],
+            (log_data.get("prompt_snippet", "") or "")[:200],
             log_data.get("restored_count", 0),
         ))
         await conn.commit()
@@ -309,6 +382,18 @@ async def get_dlp_logs(db_path: str, limit: int = 50, offset: int = 0) -> List[D
 # --- Human-in-the-Loop Approvals ---
 
 async def insert_pending_approval(db_path: str, data: Dict[str, Any]) -> None:
+    """Store sanitized approval request. NEVER write raw sensitive secrets to disk."""
+    safe_findings = []
+    for f in data.get("findings", []):
+        if isinstance(f, dict):
+            safe_findings.append({
+                "rule_name": f.get("rule_name", ""),
+                "entity_type": f.get("entity_type", ""),
+                "risk_level": f.get("risk_level", ""),
+                "redacted_token": f.get("redacted_token", ""),
+                "masked_value": f.get("masked_value", "***"),
+            })
+
     async with get_db(db_path) as conn:
         await conn.execute("""
             INSERT INTO pending_approvals (
@@ -323,22 +408,62 @@ async def insert_pending_approval(db_path: str, data: Dict[str, Any]) -> None:
             data.get("client_ip", "127.0.0.1"),
             data.get("risk_level", "MEDIUM"),
             data.get("model_requested", "auto"),
-            json.dumps(data.get("findings", [])),
+            json.dumps(safe_findings),
             json.dumps(data.get("sanitized_messages", [])),
-            json.dumps(data.get("mapping", {})),
-            json.dumps(data.get("raw_payload", {})),
+            json.dumps({}),  # Do NOT store reverse map on disk to prevent cold-storage exfiltration
+            json.dumps(data.get("sanitized_payload", {})),
         ))
         await conn.commit()
 
 
-async def update_pending_approval_status(db_path: str, approval_id: str, status: str) -> bool:
+async def update_pending_approval_status(
+    db_path: str,
+    approval_id: str,
+    status: str,
+    require_unexpired: bool = False,
+) -> bool:
+    """
+    Enforces atomic state transition: pending -> approved | rejected | expired | cancelled exactly once.
+    """
+    now_iso = _now_iso()
     async with get_db(db_path) as conn:
-        cursor = await conn.execute(
-            "UPDATE pending_approvals SET status = ? WHERE id = ?",
-            (status, approval_id)
-        )
+        if require_unexpired:
+            cursor = await conn.execute(
+                """
+                UPDATE pending_approvals
+                SET status = ?
+                WHERE id = ? AND status = 'pending' AND expires_at > ?
+                """,
+                (status, approval_id, now_iso),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                UPDATE pending_approvals
+                SET status = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, approval_id),
+            )
         await conn.commit()
         return cursor.rowcount > 0
+
+
+async def cleanup_orphan_pending(db_path: str) -> int:
+    """Expire or cancel orphan pending approvals on server startup."""
+    now_iso = _now_iso()
+    async with get_db(db_path) as conn:
+        # First expire items that passed deadline
+        await conn.execute(
+            "UPDATE pending_approvals SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
+            (now_iso,),
+        )
+        # Cancel any leftover pending items from previous crashes/restarts that have no waiter
+        cursor = await conn.execute(
+            "UPDATE pending_approvals SET status = 'cancelled' WHERE status = 'pending'"
+        )
+        await conn.commit()
+        return cursor.rowcount
 
 
 async def get_pending_approvals(db_path: str) -> List[Dict[str, Any]]:
@@ -389,14 +514,18 @@ async def get_approval_by_id(db_path: str, approval_id: str) -> Optional[Dict[st
 
 
 async def get_dashboard_stats(db_path: str) -> Dict[str, Any]:
+    today = _today_utc()
     async with get_db(db_path) as conn:
-        # Total models
+        # Total active models
         c_models = await conn.execute("SELECT COUNT(*) as cnt FROM models_pool WHERE is_active = 1")
         row_m = await c_models.fetchone()
         total_models = row_m["cnt"] if row_m else 0
 
-        # Total requests and tokens
-        c_quota = await conn.execute("SELECT SUM(requests_today) as reqs, SUM(tokens_today) as toks FROM quota_state")
+        # Total requests and tokens for today
+        c_quota = await conn.execute(
+            "SELECT SUM(requests_today) as reqs, SUM(tokens_today) as toks FROM quota_state WHERE usage_date = ?",
+            (today,),
+        )
         q_row = await c_quota.fetchone()
         total_requests = (q_row["reqs"] if q_row else 0) or 0
         total_tokens = (q_row["toks"] if q_row else 0) or 0

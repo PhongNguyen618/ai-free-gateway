@@ -3,21 +3,27 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-# Load .env if present in current directory or config directory
-load_dotenv(dotenv_path=Path("config/.env"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Load .env if present in current directory, project root, or config directory
+load_dotenv(dotenv_path=PROJECT_ROOT / "config" / ".env")
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 load_dotenv()
 
 
 class ServerConfig(BaseModel):
     host: str = Field(default="127.0.0.1")
-    port: int = Field(default=8000)
+    port: int = Field(default=8000, ge=1, le=65535)
     debug: bool = Field(default=False)
     gateway_api_key: str = Field(default="")
+    cors_allowed_origins: List[str] = Field(default_factory=list)
+    allow_insecure_external: bool = Field(default=False)
+    record_pid: bool = Field(default=True)
 
 
 class EgressConfig(BaseModel):
@@ -30,21 +36,22 @@ class EgressConfig(BaseModel):
             "api.github.com",
         ]
     )
-    timeout_seconds: float = Field(default=60.0)
-    max_request_bytes: int = Field(default=10485760)  # 10MB
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    max_request_bytes: int = Field(default=10485760, gt=0)  # 10MB
     block_private_ips: bool = Field(default=True)
+    allow_http: bool = Field(default=False)
 
 
 class EntropyScanConfig(BaseModel):
     enabled: bool = Field(default=True)
-    threshold: float = Field(default=4.5)
-    min_length: int = Field(default=20)
+    threshold: float = Field(default=4.5, ge=0.0)
+    min_length: int = Field(default=20, ge=1)
 
 
 class RiskActionConfig(BaseModel):
-    high: str = Field(default="reject")      # reject | approve | redact
-    medium: str = Field(default="approve")   # approve | redact | allow
-    low: str = Field(default="redact")       # redact | allow
+    high: Literal["reject", "approve", "redact"] = Field(default="reject")
+    medium: Literal["approve", "redact", "allow"] = Field(default="approve")
+    low: Literal["redact", "allow"] = Field(default="redact")
 
 
 class DLPConfig(BaseModel):
@@ -52,15 +59,15 @@ class DLPConfig(BaseModel):
     entropy_scan: EntropyScanConfig = Field(default_factory=EntropyScanConfig)
     risk_action: RiskActionConfig = Field(default_factory=RiskActionConfig)
     pseudonymize_reversible: bool = Field(default=True)
-    approval_timeout_seconds: int = Field(default=60)
-    approval_timeout_action: str = Field(default="reject")
+    approval_timeout_seconds: int = Field(default=60, gt=0)
+    approval_timeout_action: Literal["reject", "redact"] = Field(default="reject")
     redacted_token_format: str = Field(default="<REDACTED_{TYPE}_{INDEX}>")
     custom_blocklist: List[str] = Field(default_factory=list)
 
 
 class StaticModelConfig(BaseModel):
     id: str
-    context_length: int = Field(default=128000)
+    context_length: int = Field(default=128000, gt=0)
 
 
 class ProviderDetail(BaseModel):
@@ -68,7 +75,7 @@ class ProviderDetail(BaseModel):
     base_url: str
     models_endpoint: Optional[str] = None
     api_key_env: str
-    cooldown_seconds_on_429: int = Field(default=300)
+    cooldown_seconds_on_429: int = Field(default=300, ge=0)
     free_suffix: Optional[str] = None
     static_free_models: List[StaticModelConfig] = Field(default_factory=list)
 
@@ -81,9 +88,9 @@ class ProvidersConfig(BaseModel):
 
 
 class HarvesterConfig(BaseModel):
-    poll_interval_seconds: int = Field(default=300)
+    poll_interval_seconds: int = Field(default=300, ge=1)
     auto_discover_openrouter: bool = Field(default=True)
-    health_check_interval_seconds: int = Field(default=600)
+    health_check_interval_seconds: int = Field(default=600, ge=1)
     priority_models: List[str] = Field(
         default_factory=lambda: [
             "groq/openai/gpt-oss-120b",
@@ -115,18 +122,38 @@ class AppConfig(BaseModel):
     harvester: HarvesterConfig = Field(default_factory=HarvesterConfig)
     db_path: str = Field(default="storage/gateway.db")
 
+    def deep_copy(self) -> AppConfig:
+        return self.model_copy(deep=True)
+
 
 def load_yaml_config(config_path: Optional[str] = None) -> dict:
-    candidates = []
     if config_path:
-        candidates.append(Path(config_path))
+        p = Path(config_path)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"Specified configuration file does not exist: {config_path}")
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            return data or {}
+
     env_path = os.getenv("CONFIG_PATH")
     if env_path:
-        candidates.append(Path(env_path))
-    candidates.extend([
+        p = Path(env_path)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"CONFIG_PATH environment file does not exist: {env_path}")
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            return data or {}
+
+    candidates = [
+        PROJECT_ROOT / "config" / "settings.yaml",
+        PROJECT_ROOT / "settings.yaml",
         Path("config/settings.yaml"),
         Path("settings.yaml"),
-    ])
+    ]
 
     for p in candidates:
         if p.exists() and p.is_file():
@@ -136,8 +163,7 @@ def load_yaml_config(config_path: Optional[str] = None) -> dict:
     return {}
 
 
-@lru_cache()
-def get_config(config_path: Optional[str] = None) -> AppConfig:
+def _build_config(config_path: Optional[str] = None) -> AppConfig:
     raw_data = load_yaml_config(config_path)
 
     # Allow environment variables override
@@ -154,6 +180,17 @@ def get_config(config_path: Optional[str] = None) -> AppConfig:
         raw_data["db_path"] = os.getenv("SQLITE_DB_PATH")
 
     return AppConfig(**raw_data)
+
+
+@lru_cache(maxsize=4)
+def _get_base_config_cached(config_path: Optional[str] = None) -> AppConfig:
+    return _build_config(config_path)
+
+
+def get_config(config_path: Optional[str] = None) -> AppConfig:
+    """Always return an isolated deep copy to prevent tests from mutating shared state."""
+    base = _get_base_config_cached(config_path)
+    return base.deep_copy()
 
 
 def get_provider_api_key(provider_name: str, config: AppConfig) -> str:

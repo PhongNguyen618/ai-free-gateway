@@ -1,24 +1,24 @@
 # AI Free Gateway 🛡️⚡
 
 > **Local Zero-Trust OpenAI-Compatible Proxy & Free-Tier AI Harvester**  
-> Tự động quét và định tuyến yêu cầu tới các API LLM miễn phí (OpenRouter `:free`, Groq, Gemini Free, GitHub Models) kết hợp hệ thống ngăn chặn thất thoát dữ liệu cục bộ (Zero-Trust DLP), phê duyệt Human-in-the-Loop và hỗ trợ streaming SSE.
+> Tự động quét và định tuyến yêu cầu tới các API LLM miễn phí (OpenRouter verified $0, Groq, Gemini Free Tier, GitHub Models) kết hợp hệ thống ngăn chặn thất thoát dữ liệu cục bộ (Zero-Trust DLP), phê duyệt Human-in-the-Loop và hỗ trợ streaming SSE.
 
 ---
 
 ## 🌟 Tính Năng Nổi Bật
 
-1. **Zero External Telemetry DLP**: Quét regex chuyên sâu kết hợp tính toán Shannon Entropy cục bộ 100% offline. Phát hiện và xử lý:
+1. **Zero External Telemetry DLP**: Quét regex chuyên sâu kết hợp tính toán Shannon Entropy cục bộ 100% offline. Phát hiện và xử lý trên toàn bộ các kênh truyền (messages content, tool_calls arguments, function_call, tools schema & descriptions):
    - AWS Keys, OpenAI Keys, GitHub Tokens, Google API Keys, Slack Tokens, JWT.
    - Private Keys (RSA/EC/DSA/PGP), Passwords trong Connection String.
    - Thông tin định danh cá nhân (Email, Số điện thoại Việt Nam & Quốc tế, Số CCCD 12 số, Thẻ tín dụng kiểm tra chuẩn thuật toán Luhn).
    - Địa chỉ IP nội bộ (10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.0.0.1).
-2. **Reversible Pseudonymization**: Thay thế tự động các dữ liệu nhạy cảm bằng token định danh `<REDACTED_TYPE_N>` và khôi phục nguyên trạng khi nhận kết quả từ LLM.
-3. **SSE Streaming Support**: Khôi phục token trực tiếp theo thời gian thực ngay trên Server-Sent Events stream (`stream=True`) với bộ đệm chống đứt đoạn token (`StreamingRestorer`).
-4. **Human-in-the-Loop (HITL) Gate**: Hàng đợi bất đồng bộ với `asyncio.Event` cho phép quản trị viên phê duyệt hoặc từ chối các request chứa dữ liệu rủi ro trung bình/cao ngay trên Web UI Dashboard.
-5. **Egress Guard**: Chặn tuyệt đối các domain ngoài whitelist, ngăn chặn HTTP redirect SSRF (`follow_redirects=False`) và kiểm soát dung lượng outbound.
-6. **Free-Tier Harvester**: Tự động tìm kiếm các model $0 trên OpenRouter và quản lý model pool từ Groq, Gemini, GitHub Models.
-7. **Smart Fallback Router**: Tự động chuyển vùng provider khi gặp lỗi 429 Rate Limit hoặc lỗi 5xx mà không làm gián đoạn ứng dụng người dùng.
-8. **Modern Dark Dashboard**: Giao diện TailwindCSS quản lý model pool, quota cooldowns, DLP audit logs và duyệt request pending.
+2. **Reversible Pseudonymization**: Thay thế tự động các dữ liệu nhạy cảm bằng token định danh `<REDACTED_TYPE_N>` và khôi phục nguyên trạng khi nhận kết quả từ LLM (cả text content và tool call arguments).
+3. **SSE Streaming Support**: Khôi phục token trực tiếp theo thời gian thực ngay trên Server-Sent Events stream (`stream=True`) với bộ đệm chống đứt đoạn token (`StreamingRestorer`), hỗ trợ đa choice độc lập và incremental UTF-8 decoder không làm vỡ ký tự tiếng Việt / emoji.
+4. **Human-in-the-Loop (HITL) Gate**: Hàng đợi bất đồng bộ với atomic SQLite state transitions cho phép quản trị viên phê duyệt hoặc từ chối các request chứa dữ liệu nhạy cảm ngay trên Web UI Dashboard.
+5. **Egress Guard**: Chặn tuyệt đối các domain ngoài whitelist, kiểm tra DNS bất đồng bộ chống SSRF/private IP, đo chính xác kích thước payload trước khi gửi cho cả JSON và Stream, ngăn chặn HTTP redirect SSRF (`follow_redirects=False`) và vô hiệu hóa proxy môi trường (`trust_env=False`).
+6. **Strict Free-Tier Harvester**: Chỉ tuyển chọn các model có giá prompt và completion được xác minh nghiêm ngặt bằng $0 trên OpenRouter; tự động loại bỏ các model tăng giá hoặc biến mất qua snapshot reconciliation.
+7. **Smart Fallback Router**: Tự động chuyển vùng provider khi gặp lỗi 429 Rate Limit; skip ngay toàn bộ các model còn lại của provider đang bị cooldown trong cùng một request.
+8. **100% Offline Modern Dark Dashboard**: Giao diện thuần túy không dùng CDN ngoài, bảo mật XSS tuyệt đối qua DOM APIs, hỗ trợ lưu Gateway API Key an toàn trong `sessionStorage`.
 
 ---
 
@@ -31,24 +31,26 @@ ai-free-gateway/
 │   └── .env.example             # Template API keys (OPENROUTER_API_KEY, GROQ_API_KEY, ...)
 ├── src/
 │   ├── __init__.py
-│   ├── main.py                  # Khởi tạo FastAPI app, CORS, mount UI static, background tasks
+│   ├── main.py                  # App factory create_app(), auth middleware, CORS, lifespan
 │   ├── config_loader.py         # Pydantic models load & validate settings.yaml và .env
 │   ├── storage/
 │   │   └── db.py                # SQLite bất đồng bộ (aiosqlite): models_pool, quota_state, dlp_audit_logs
 │   ├── security/
-│   │   ├── sanitizer.py         # Regex + Shannon Entropy scanner, reversible pseudonymization (<ENTITY_ID>)
-│   │   ├── approval_gate.py     # Hàng đợi bất đồng bộ Human-in-the-Loop approval
-│   │   └── egress_guard.py      # httpx wrapper chặn domain ngoài whitelist & log byte size
+│   │   ├── sanitizer.py         # Regex + Shannon Entropy scanner, reversible pseudonymization
+│   │   ├── approval_gate.py     # Hàng đợi bất đồng bộ Human-in-the-Loop approval (atomic state)
+│   │   └── egress_guard.py      # Zero-Trust HTTP client & async DNS SSRF filter
 │   ├── discovery/
-│   │   └── harvester.py         # Polling OpenRouter $0 models & health check quota
+│   │   └── harvester.py         # Polling OpenRouter $0 models & snapshot reconciliation
 │   └── router/
-│       ├── balancer.py          # Chọn free model tối ưu theo task, latency và 429 cooldown
+│       ├── balancer.py          # Chọn free model tối ưu, dedup alias (provider, model_name)
 │       └── openai_proxy.py      # Endpoints chuẩn OpenAI: /v1/chat/completions & /v1/models
 ├── ui/
-│   └── index.html               # Clean Dark-Mode Dashboard (Quotas, Audit Logs, Approvals)
-├── tests/                       # Bộ kiểm thử tự động pytest
+│   └── index.html               # 100% Offline Dark-Mode Dashboard (XSS-safe DOM, sessionStorage)
+├── tests/                       # 47 automated tests (isolation, app factory, regression suite)
 ├── requirements.txt
-└── pytest.ini
+├── pytest.ini
+├── start.bat                    # Script khởi chạy nhanh trên Windows
+└── stop.bat                     # Script dừng an toàn dựa trên PID của Gateway
 ```
 
 ---
@@ -56,11 +58,8 @@ ai-free-gateway/
 ## 🚀 Hướng Dẫn Cài Đặt & Sử Dụng
 
 ### 1. Khởi chạy nhanh 1-Click trên Windows
-Dự án đã có sẵn các script tự động hóa:
-- **`start.bat`**: Nhấp đúp để tự động kiểm tra Python, tạo `.venv`, cài đặt `requirements.txt` nếu thiếu và chạy server có cửa sổ giao diện dòng lệnh.
-- **`install_autostart.bat`**: Nhấp đúp để đăng ký **khởi động cùng Windows (chạy ngầm hoàn toàn)**.
-- **`stop.bat`**: Nhấp đúp để dừng tiến trình gateway đang chạy ngầm trên cổng 8000.
-- **`uninstall_autostart.bat`**: Nhấp đúp để hủy tự động khởi động cùng Windows.
+- **`start.bat`**: Nhấp đúp để tự động kiểm tra Python, tạo `.venv`, cài đặt `requirements.txt` nếu thiếu và chạy server.
+- **`stop.bat`**: Nhấp đúp để dừng an toàn gateway dựa trên PID ghi trong `.gateway.pid` (không kill nhầm các ứng dụng khác).
 
 ### 2. Cài đặt thủ công
 Yêu cầu Python 3.11+.
@@ -76,77 +75,54 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Cấu hình API Keys (Tùy chọn)
-Sao chép file `.env.example` thành `.env` và nhập các API key miễn phí bạn sở hữu:
+### 3. Cấu hình API Keys (Tùy chọn)
+Sao chép file `.env.example` thành `.env` và nhập các API key bạn sở hữu:
 ```bash
 cp config/.env.example config/.env
 ```
-*(Nếu chưa có API Key, hệ thống vẫn khởi động bình thường với các model được cấu hình sẵn trong pool).*
+*(Nếu chưa có API Key, hệ thống vẫn khởi động bình thường với các model miễn phí được cấu hình sẵn trong pool).*
 
-### 3. Khởi chạy Gateway Server
+### 4. Khởi chạy Gateway Server
 ```bash
 python -m src.main
 ```
-Hoặc dùng Uvicorn:
-```bash
-uvicorn src.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-- **Web Dashboard**: Truy cập `http://127.0.0.1:8000/` hoặc `http://127.0.0.1:8000/ui`
-- **OpenAI Endpoint Base URL**: `http://127.0.0.1:8000/v1`
+- **Web Dashboard**: `http://127.0.0.1:8000/` hoặc `http://127.0.0.1:8000/ui`
+- **OpenAI Base URL**: `http://127.0.0.1:8000/v1`
 
 ---
 
-## 🧪 Ví Dụ Sử Dụng Với OpenAI Client (Python / Curl)
+## 🔒 Quản Trị Bảo Mật & Giới Hạn Kỹ Thuật
 
-### Gửi yêu cầu qua cURL
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "auto",
-    "messages": [
-      {"role": "user", "content": "Viết cho tôi một hàm Python tính Fibonacci"}
-    ],
-    "stream": false
-  }'
-```
-
-### Sử dụng với thư viện `openai` trong Python
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8000/v1",
-    api_key="not-needed"  # Hoặc điền master key nếu cấu hình gateway_api_key
-)
-
-response = client.chat.completions.create(
-    model="auto",  # hoặc chỉ định model cụ thể: "llama-3.3-70b-versatile"
-    messages=[
-        {"role": "user", "content": "Server nội bộ của tôi là 192.168.1.50, hãy viết script ping kiểm tra."}
-    ]
-)
-
-print(response.choices[0].message.content)
-```
-
----
-
-## 🛡️ Cơ Chế Bảo Vệ Zero-Trust DLP
-
-- Nếu bạn gửi prompt có chứa **API Key** (ví dụ `AKIAIOSFODNN7EXAMPLE`) hoặc **Private Key**:
-  - Request lập tức bị chặn với mã lỗi `403 Forbidden` (`dlp_violation`).
-  - Ghi nhận chi tiết vào **DLP Audit Logs** cục bộ.
-- Nếu bạn gửi prompt chứa thông tin nhạy cảm mức trung bình (Email, IP nội bộ, CCCD):
-  - Request chuyển sang trạng thái chờ duyệt **Pending Approval**.
-  - Mở Web Dashboard tại `http://127.0.0.1:8000/` để xem chi tiết và bấm **Approve** hoặc **Reject**.
+1. **Dual Projection DLP & Audit Isolation**:
+   - Tách biệt hoàn toàn hai hình chiếu dữ liệu: `outbound_payload` (tuân thủ cấu hình policy allow / redact / approve) và `audit_payload` (luôn luôn redact 100% các dữ liệu nhạy cảm).
+   - Kể cả khi cấu hình `medium=allow`, địa chỉ email hoặc IP nội bộ thật sự được phép gửi ra upstream nhưng SQLite `dlp_audit_logs` và hàng đợi `pending_approvals` CHỈ lưu trữ token `<REDACTED_...>` an toàn, ngăn chặn triệt để rò rỉ dữ liệu nhạy cảm vào database nội bộ.
+2. **DNS Pinning & Socket Address Pinning**:
+   - Sử dụng `PinnedNetworkBackend` tích hợp trong `AsyncConnectionPool` để kết nối TCP trực tiếp tới địa chỉ IP công khai đã được xác minh.
+   - Giữ nguyên hostname gốc cho TLS SNI (`server_hostname`) và HTTP `Host` header nhằm đảm bảo kiểm tra chứng chỉ hợp lệ và triệt tiêu nguy cơ Time-of-Check to Time-of-Use (TOCTOU) DNS Rebinding.
+3. **Context Window Budgeting & Routing**:
+   - Dự toán token chi tiết dựa trên toàn bộ messages, tool definitions, tool call arguments và output reserve (`max_tokens`/`max_completion_tokens`).
+   - Yêu cầu model tường minh không tồn tại trong pool sẽ trả về mã `HTTP 404 model_not_found`; nếu model có trong pool nhưng không đủ context length sẽ trả về `HTTP 400 context_length_exceeded`.
+4. **Bảo toàn Giao thức Tool Calling**:
+   - Giữ nguyên vẹn định danh giao thức: `tool_call_id`, `tool_calls[].id`, `type`, `name`.
+   - Parse và phục hồi an toàn chuỗi arguments JSON chứa escaped quotes, backslashes và newlines.
+5. **Zero Upstream Error Leakage**:
+   - Toàn bộ lỗi từ upstream (HTTP 4xx, 5xx) được chuẩn hóa nội bộ theo mã status và tên provider.
+   - Tuyệt đối không lưu trữ hoặc trả về `resp.text` thô của upstream cho client, log hoặc dashboard nhằm ngăn chặn lộ API key hay dữ liệu nội bộ.
+6. **Gateway Master Key**:
+   - Khi cấu hình `gateway_api_key`, mọi API proxy `/v1/*` và dashboard `/api/*` đều yêu cầu xác thực bằng constant-time comparison.
+   - Khi bind gateway ra host ngoài loopback (không phải `127.0.0.1`), bắt buộc phải có `gateway_api_key` hoặc cờ `allow_insecure_external: true`.
+7. **Giới Hạn Kỹ Thuật**:
+   - Zero-Trust DLP hiện tại tập trung bảo vệ văn bản (Text Modality). Các định dạng nhị phân chưa hỗ trợ quét bảo mật (`image_url`, `input_audio`, `file`) sẽ bị từ chối rõ ràng bằng mã lỗi `HTTP 400 Bad Request`.
+   - Hệ thống được thiết kế tối ưu cho môi trường Single-Worker để duy trì trạng thái approval atomic và tránh race condition.
 
 ---
 
 ## 🧪 Chạy Kiểm Thử (Automated Tests)
 
+Chạy toàn bộ 60 automated tests hoàn toàn offline:
+
 ```bash
-.\.venv\Scripts\pytest -v
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
-Toàn bộ 11/11 bài test (Entropy Scanner, Luhn Checksum, Reversible Pseudonymization, Streaming Restorer, Egress Guard, Storage DB, Approval Gate, API Endpoints) đều vượt qua thành công!
+
+Kết quả: **60 passed in ~25s** (100% offline, không chạm DB thật, không gọi mạng ngoài, cô lập cấu hình và test database tạm).

@@ -33,3 +33,4 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+.gateway.pid

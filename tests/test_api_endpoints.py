@@ -2,17 +2,21 @@ import asyncio
 import json
 import pytest
 from httpx import AsyncClient, ASGITransport
-from src.main import app
+from src.main import create_app
 from src.storage import db as storage_db
 from src.config_loader import get_config
 
 
-@pytest.fixture(autouse=True)
-async def setup_test_environment():
+@pytest.fixture
+async def isolated_app(tmp_path):
+    """Provide isolated app instance and database per test (F10)."""
+    test_db = str(tmp_path / "test_api_endpoints.db")
     config = get_config()
-    await storage_db.init_db(config.db_path)
-    # Register mock model in pool
-    await storage_db.upsert_model(config.db_path, {
+    config.db_path = test_db
+
+    await storage_db.init_db(test_db)
+    # Register mock model in isolated pool
+    await storage_db.upsert_model(test_db, {
         "id": "groq/llama-3.3-70b-versatile",
         "provider": "groq",
         "model_name": "llama-3.3-70b-versatile",
@@ -22,16 +26,19 @@ async def setup_test_environment():
         "is_active": True,
         "latency_ms": 100.0,
     })
-    yield
+
+    app = create_app(config)
+    yield app, test_db
 
 
 @pytest.mark.asyncio
-async def test_health_and_ui():
+async def test_health_and_ui(isolated_app):
+    app, _ = isolated_app
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/health")
         assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
+        assert resp.json() == {"status": "ok"}
 
         # UI endpoint
         ui_resp = await client.get("/")
@@ -40,7 +47,8 @@ async def test_health_and_ui():
 
 
 @pytest.mark.asyncio
-async def test_api_models():
+async def test_api_models(isolated_app):
+    app, _ = isolated_app
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/v1/models")
@@ -52,7 +60,9 @@ async def test_api_models():
 
 
 @pytest.mark.asyncio
-async def test_dlp_high_risk_rejection():
+async def test_dlp_high_risk_rejection(isolated_app):
+    app, _ = isolated_app
+    app.state.config.dlp.risk_action.high = "reject"
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Prompt containing an AWS Secret Key (High Risk)
@@ -70,7 +80,8 @@ async def test_dlp_high_risk_rejection():
 
 
 @pytest.mark.asyncio
-async def test_dashboard_stats():
+async def test_dashboard_stats(isolated_app):
+    app, _ = isolated_app
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/api/stats")
@@ -82,7 +93,8 @@ async def test_dashboard_stats():
 
 
 @pytest.mark.asyncio
-async def test_routing_status_endpoint():
+async def test_routing_status_endpoint(isolated_app):
+    app, _ = isolated_app
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/api/routing/status")

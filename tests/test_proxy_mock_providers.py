@@ -17,14 +17,14 @@ from fastapi import FastAPI
 
 
 @pytest.mark.asyncio
-async def test_proxy_chat_completions_non_stream_with_restoration(monkeypatch):
+async def test_proxy_chat_completions_non_stream_with_restoration(monkeypatch, tmp_path):
     """
     Test that sensitive data in prompt is sanitized before sending to upstream provider,
     and when the provider returns the placeholder in the answer, the proxy automatically
     restores the original value for the client!
     """
     config = get_config()
-    test_db = "storage/test_proxy_mock.db"
+    test_db = str(tmp_path / "test_proxy_mock.db")
     await storage_db.init_db(test_db)
 
     # Insert test model
@@ -129,7 +129,7 @@ async def test_proxy_chat_completions_non_stream_with_restoration(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_automatic_429_cooldown_and_fallback(monkeypatch):
+async def test_proxy_automatic_429_cooldown_and_fallback(monkeypatch, tmp_path):
     """
     Test that when provider A returns HTTP 429 Rate Limit, the gateway:
     1. Records cooldown in database for provider A
@@ -137,8 +137,7 @@ async def test_proxy_automatic_429_cooldown_and_fallback(monkeypatch):
     3. Successfully returns response from provider B to client without interruption!
     """
     config = get_config()
-    import time
-    test_db = f"storage/test_proxy_fallback_{int(time.time() * 1000)}.db"
+    test_db = str(tmp_path / "test_proxy_fallback.db")
     await storage_db.init_db(test_db)
 
     # Insert two models from different providers
@@ -237,13 +236,13 @@ async def test_proxy_automatic_429_cooldown_and_fallback(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_chat_completions_streaming_sse(monkeypatch):
+async def test_proxy_chat_completions_streaming_sse(monkeypatch, tmp_path):
     """
     Test Server-Sent Events (stream=True) with real chunking, token split handling,
     and [DONE] termination.
     """
     config = get_config()
-    test_db = "storage/test_proxy_stream.db"
+    test_db = str(tmp_path / "test_proxy_stream.db")
     await storage_db.init_db(test_db)
 
     await storage_db.upsert_model(test_db, {

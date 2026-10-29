@@ -23,7 +23,7 @@ dlp:
     threshold: 4.5
     min_length: 20
   risk_action:
-    high: "reject"      # reject | approve | redact
+    high: "redact"      # reject | approve | redact
     medium: "approve"   # approve | redact | allow
     low: "redact"       # redact | allow
   pseudonymize_reversible: true

@@ -97,8 +97,8 @@ def test_egress_guard_validation():
 
 
 @pytest.mark.asyncio
-async def test_storage_db_lifecycle():
-    test_db = "storage/test_gateway.db"
+async def test_storage_db_lifecycle(tmp_path):
+    test_db = str(tmp_path / "test_gateway.db")
     await storage_db.init_db(test_db)
 
     # Upsert model
@@ -152,8 +152,8 @@ async def test_storage_db_lifecycle():
 
 
 @pytest.mark.asyncio
-async def test_approval_gate_lifecycle():
-    test_db = "storage/test_gate.db"
+async def test_approval_gate_lifecycle(tmp_path):
+    test_db = str(tmp_path / "test_gate.db")
     await storage_db.init_db(test_db)
     gate = ApprovalGate(db_path=test_db)
 
