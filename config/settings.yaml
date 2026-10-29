@@ -43,33 +43,21 @@ providers:
     enabled: true
     base_url: "https://api.groq.com/openai/v1"
     api_key_env: "GROQ_API_KEY"
-    cooldown_seconds_on_429: 300
+    cooldown_seconds_on_429: 60
     static_free_models:
-      - id: "qwen/qwen3.8-27b"
-        context_length: 128000
       - id: "openai/gpt-oss-120b"
+        context_length: 128000
+      - id: "qwen/qwen3.8-27b"
         context_length: 128000
       - id: "openai/gpt-oss-20b"
         context_length: 128000
-      - id: "llama-3.3-70b-versatile"
-        context_length: 128000
-      - id: "llama-3.1-8b-instant"
-        context_length: 128000
-      - id: "gemma2-9b-it"
-        context_length: 8192
-      - id: "mixtral-8x7b-32768"
-        context_length: 32768
   gemini:
-    enabled: true
+    enabled: false
     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
     api_key_env: "GEMINI_API_KEY"
     cooldown_seconds_on_429: 300
     static_free_models:
-      - id: "gemini-1.5-flash"
-        context_length: 1048576
-      - id: "gemini-1.5-flash-8b"
-        context_length: 1048576
-      - id: "gemini-2.0-flash-exp"
+      - id: "gemini-2.5-flash"
         context_length: 1048576
   github:
     enabled: true
@@ -93,15 +81,12 @@ harvester:
   priority_models:
     - "groq/openai/gpt-oss-120b"
     - "groq/qwen/qwen3.8-27b"
+    - "groq/openai/gpt-oss-20b"
+    - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
     - "openrouter/deepseek/deepseek-r1:free"
     - "openrouter/qwen/qwen-2.5-coder-32b-instruct:free"
-    - "openrouter/meta-llama/llama-3.3-70b-instruct:free"
-    - "gemini/gemini-2.0-flash-exp"
-    - "gemini/gemini-1.5-flash"
-    - "groq/openai/gpt-oss-20b"
-    - "groq/llama-3.1-8b-instant"
+    - "openrouter/google/gemma-4-26b-a4b-it:free"
   default_fallback_models:
     - "groq/openai/gpt-oss-120b"
     - "groq/qwen/qwen3.8-27b"
-    - "openrouter/auto"
-    - "gemini/gemini-1.5-flash"
+    - "groq/openai/gpt-oss-20b"

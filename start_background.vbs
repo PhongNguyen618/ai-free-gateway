@@ -5,12 +5,12 @@ Set WshShell = CreateObject("WScript.Shell")
 scriptDir = FSO.GetParentFolderName(WScript.ScriptFullName)
 WshShell.CurrentDirectory = scriptDir
 
-' Chay python trong .venv qua cmd an (style 0: an hoan toan khong hien man hinh den)
+' Chay truc tiep python trong .venv o che do an hoan toan (window style 0, khong hien man hinh den)
 pythonExe = scriptDir & "\.venv\Scripts\python.exe"
 If FSO.FileExists(pythonExe) Then
-    cmd = "cmd.exe /c """"" & pythonExe & """ -m src.main"""
+    cmd = """" & pythonExe & """ -m src.main"
 Else
-    cmd = "cmd.exe /c python -m src.main"
+    cmd = "python -m src.main"
 End If
 
 WshShell.Run cmd, 0, False
