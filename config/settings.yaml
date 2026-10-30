@@ -79,14 +79,16 @@ harvester:
   auto_discover_openrouter: true
   health_check_interval_seconds: 600
   priority_models:
+    - "github/gpt-4o-mini"
+    - "github/Meta-Llama-3.1-70B-Instruct"
     - "groq/openai/gpt-oss-120b"
     - "groq/qwen/qwen3.8-27b"
-    - "groq/openai/gpt-oss-20b"
-    - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
-    - "openrouter/deepseek/deepseek-r1:free"
     - "openrouter/qwen/qwen-2.5-coder-32b-instruct:free"
+    - "openrouter/deepseek/deepseek-r1:free"
     - "openrouter/google/gemma-4-26b-a4b-it:free"
+    - "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
   default_fallback_models:
+    - "github/gpt-4o-mini"
     - "groq/openai/gpt-oss-120b"
     - "groq/qwen/qwen3.8-27b"
     - "groq/openai/gpt-oss-20b"

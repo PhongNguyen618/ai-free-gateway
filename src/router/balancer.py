@@ -384,18 +384,20 @@ class ModelBalancer:
                     pass
 
         # Top-tier family boosts
+        if "gpt-4o" in name_lower or "gpt-4" in name_lower:
+            score += 250.0
+        elif "gpt-oss" in name_lower:
+            score += 150.0
         if "deepseek" in name_lower:
-            score += 120.0
+            score += 140.0
         if "qwen" in name_lower:
-            score += 110.0
+            score += 130.0
         if "llama-3" in name_lower or "llama3" in name_lower:
-            score += 100.0
+            score += 120.0
         if "gemini-2" in name_lower or "gemini-1.5-pro" in name_lower:
             score += 110.0
         elif "gemini" in name_lower:
             score += 80.0
-        if "gpt-4" in name_lower or "gpt-oss" in name_lower:
-            score += 110.0
         if "claude" in name_lower:
             score += 120.0
         if "mistral" in name_lower or "mixtral" in name_lower:
@@ -405,7 +407,13 @@ class ModelBalancer:
             score += 120.0
 
         if any(term in name_lower for term in ["coder", "coding", "starcoder"]):
-            score += 130.0
+            score += 150.0
+
+        # Penalize non-chat, safety-only, or tiny incapable models for coding/agents
+        if any(term in name_lower for term in ["safety", "guard", "moderation", "classifier"]):
+            score -= 800.0
+        if any(term in name_lower for term in ["-1b", "-2b", "-2.6b", "-3b", "tiny", "small", "-xs", "preview-tts"]):
+            score -= 250.0
 
         if task_type == "code":
             if any(term in name_lower for term in ["code", "coder", "deepseek", "qwen", "llama-3"]):
@@ -428,6 +436,7 @@ class ModelBalancer:
         requested_model: str,
         prompt_text: str = "",
         estimated_tokens: int = 1000,
+        has_tools: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Build an ordered list of candidate models for routing and fallback.
@@ -436,7 +445,7 @@ class ModelBalancer:
         - If an explicit model is requested and not found in pool -> raises ModelNotFoundError.
         - If an explicit model is found but context_length < estimated_tokens -> raises ContextLengthExceededError.
         """
-        task_type = self.classify_task(prompt_text)
+        task_type = "code" if has_tools else self.classify_task(prompt_text)
         all_models = await storage_db.get_active_models(self.db_path)
 
         # Get cooldown status per provider

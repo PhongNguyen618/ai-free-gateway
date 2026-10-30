@@ -800,12 +800,14 @@ def create_openai_router(
 
             # 5. Routing context budget & candidate chain lookup (R2-09)
             estimated_tokens = estimate_payload_tokens(outgoing_payload)
+            has_tools = bool(validated.tools or validated.tool_choice)
 
             try:
                 candidates = await balancer.get_candidate_chain(
                     requested_model=requested_model,
                     prompt_text=audit_prompt_snippet,
                     estimated_tokens=estimated_tokens,
+                    has_tools=has_tools,
                 )
             except ModelNotFoundError as mne:
                 return JSONResponse(
