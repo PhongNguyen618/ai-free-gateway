@@ -103,9 +103,12 @@ async def test_stream_tool_indices_and_completion_metrics(review_app, monkeypatc
     token = "<REDACTED_EMAIL_1>"
     app.state.config.dlp.risk_action.medium = "redact"
     closed = []
+    val0 = json.dumps({"email": token})
+    val1 = json.dumps({"tool": "SECOND_TOOL"})
+    split_pos = len(val0) // 2
     async def stream(*args, **kwargs):
         try:
-            for index, value in [(0, token[:15]), (1, "SECOND_TOOL"), (0, token[15:])]:
+            for index, value in [(0, val0[:split_pos]), (1, val1), (0, val0[split_pos:])]:
                 event = {"choices": [{"index": 0, "delta": {"tool_calls": [
                     {"index": index, "function": {"arguments": value}},
                 ]}}]}
@@ -125,7 +128,8 @@ async def test_stream_tool_indices_and_completion_metrics(review_app, monkeypatc
             for choice in json.loads(line[6:]).get("choices", []):
                 for call in choice.get("delta", {}).get("tool_calls", []):
                     arguments[call["index"]] += call["function"]["arguments"]
-    assert arguments == {0: "alice@example.com", 1: "SECOND_TOOL"}
+    assert json.loads(arguments[0]) == {"email": "alice@example.com"}
+    assert json.loads(arguments[1]) == {"tool": "SECOND_TOOL"}
     assert closed == [True]
     model = await db.get_model_by_id(config.db_path, "groq/test")
     assert model["success_count"] == int(complete)

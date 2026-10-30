@@ -889,6 +889,7 @@ def create_openai_router(
                             candidate=candidate,
                             reverse_map=reverse_map if config.dlp.pseudonymize_reversible else {},
                             config=config,
+                            overall_deadline_timestamp=start_candidates_time + total_completion_deadline,
                         )
 
                         # Probe first item to verify provider readiness before emitting HTTP 200, bounded by deadline
@@ -1183,6 +1184,7 @@ async def _handle_streaming_proxy(
     candidate: Dict[str, Any],
     reverse_map: Dict[str, str],
     config: AppConfig,
+    overall_deadline_timestamp: Optional[float] = None,
 ) -> AsyncIterator[bytes]:
     """
     Handles streaming responses with incremental UTF-8 decoding, per-choice and per-channel
@@ -1244,7 +1246,7 @@ async def _handle_streaming_proxy(
             for c_idx, tools in by_choice.items():
                 tool_deltas = []
                 for t_idx, raw_args in tools:
-                    restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=True)
+                    restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=False)
                     tool_deltas.append({
                         "index": t_idx,
                         "function": {"arguments": restored_args},
@@ -1265,6 +1267,9 @@ async def _handle_streaming_proxy(
     start_time = time.perf_counter()
     first_event_deadline = start_time + config.server.first_event_timeout_seconds
     max_duration_deadline = start_time + config.server.max_stream_duration_seconds
+    if overall_deadline_timestamp is not None:
+        max_duration_deadline = min(max_duration_deadline, overall_deadline_timestamp)
+        first_event_deadline = min(first_event_deadline, overall_deadline_timestamp)
 
     upstream = egress_guard.stream_post(target_url, headers=headers, json_data=payload)
     upstream_iter = upstream.__aiter__()
@@ -1273,31 +1278,45 @@ async def _handle_streaming_proxy(
         while True:
             now = time.perf_counter()
             if now >= max_duration_deadline:
-                logger.error(f"Stream max duration exceeded ({config.server.max_stream_duration_seconds}s)")
+                logger.error("Stream total completion deadline or max duration exceeded")
                 stream_failed = True
+                await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                 if not has_yielded:
-                    raise TimeoutError("Stream max duration exceeded before first event")
-                err_payload = make_openai_error("Stream max duration exceeded", "stream_timeout")
+                    raise TimeoutError("Stream total completion deadline exceeded before first event")
+                err_payload = make_openai_error("Total completion deadline exceeded", "stream_timeout")
                 yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                 return
 
             if not has_received_valid_completion:
                 remaining_first = first_event_deadline - now
                 if remaining_first <= 0:
+                    stream_failed = True
+                    await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                     raise TimeoutError(f"First event timeout exceeded ({config.server.first_event_timeout_seconds}s)")
                 chunk_timeout = min(remaining_first, max_duration_deadline - now)
             else:
                 chunk_timeout = min(config.server.idle_timeout_seconds, max_duration_deadline - now)
 
+            if chunk_timeout <= 0:
+                logger.error("Stream total completion deadline exceeded waiting for next chunk")
+                stream_failed = True
+                await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                if not has_yielded:
+                    raise TimeoutError("Stream total completion deadline exceeded")
+                err_payload = make_openai_error("Total completion deadline exceeded", "stream_timeout")
+                yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                return
+
             try:
-                chunk_bytes = await asyncio.wait_for(upstream_iter.__anext__(), timeout=max(0.01, chunk_timeout))
+                chunk_bytes = await asyncio.wait_for(upstream_iter.__anext__(), timeout=chunk_timeout)
             except (asyncio.TimeoutError, TimeoutError):
+                stream_failed = True
+                await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                 if not has_received_valid_completion:
                     raise TimeoutError("First event timeout waiting for valid completion chunk")
                 else:
-                    stream_failed = True
-                    logger.error("Stream idle timeout or max duration exceeded")
-                    err_payload = make_openai_error("Stream idle timeout exceeded", "stream_timeout")
+                    logger.error("Stream total completion deadline exceeded during stream transmission")
+                    err_payload = make_openai_error("Total completion deadline exceeded", "stream_timeout")
                     yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                     return
             except StopAsyncIteration:
@@ -1310,6 +1329,7 @@ async def _handle_streaming_proxy(
             if len(line_buffer.encode("utf-8")) > config.server.max_sse_line_bytes:
                 logger.error("SSE line exceeded max_sse_line_bytes limit")
                 stream_failed = True
+                await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                 err_payload = make_openai_error("SSE line exceeded maximum allowed buffer size", "stream_error")
                 yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                 return
@@ -1327,6 +1347,7 @@ async def _handle_streaming_proxy(
                         if event_size > config.server.max_sse_event_bytes:
                             logger.error("SSE event exceeded max_sse_event_bytes limit")
                             stream_failed = True
+                            await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                             err_payload = make_openai_error("SSE event exceeded maximum allowed buffer size", "stream_error")
                             yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                             return
@@ -1336,7 +1357,16 @@ async def _handle_streaming_proxy(
 
                         if raw_data.strip() == "[DONE]":
                             has_seen_done = True
-                            for chk in flush_all_remaining():
+                            try:
+                                chunks_to_emit = flush_all_remaining()
+                            except Exception as e:
+                                stream_failed = True
+                                logger.error("Invalid upstream tool arguments JSON on flush: %s", e)
+                                await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                                err_payload = make_openai_error("Invalid upstream tool arguments JSON", "stream_error")
+                                yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                                return
+                            for chk in chunks_to_emit:
                                 has_yielded = True
                                 yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
                             has_yielded = True
@@ -1435,6 +1465,7 @@ async def _handle_streaming_proxy(
                                         except Exception as e:
                                             stream_failed = True
                                             logger.error(f"Invalid upstream tool arguments JSON: {e}")
+                                            await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
                                             err_payload = make_openai_error("Invalid upstream tool arguments JSON", "stream_error")
                                             yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                                             return
@@ -1486,7 +1517,16 @@ async def _handle_streaming_proxy(
             raw_data = "\n".join(current_data_lines)
             if raw_data.strip() == "[DONE]":
                 has_seen_done = True
-                for chk in flush_all_remaining():
+                try:
+                    chunks_to_emit = flush_all_remaining()
+                except Exception as e:
+                    stream_failed = True
+                    logger.error("Invalid upstream tool arguments JSON on flush: %s", e)
+                    await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                    err_payload = make_openai_error("Invalid upstream tool arguments JSON", "stream_error")
+                    yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                    return
+                for chk in chunks_to_emit:
                     has_yielded = True
                     yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
@@ -1494,7 +1534,13 @@ async def _handle_streaming_proxy(
         # Check stream completeness contract (R2-06)
         if not has_seen_done:
             logger.error(f"Stream from provider {provider} terminated prematurely without [DONE]")
-            for chk in flush_all_remaining():
+            stream_failed = True
+            await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+            try:
+                chunks_to_emit = flush_all_remaining()
+            except Exception as e:
+                chunks_to_emit = []
+            for chk in chunks_to_emit:
                 has_yielded = True
                 yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
             has_yielded = True

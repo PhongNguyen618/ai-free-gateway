@@ -152,6 +152,60 @@ async def test_total_completion_deadline_enforced_against_slow_upstream(tmp_path
         assert data["error"]["code"] == "gateway_timeout"
 
 
+@pytest.mark.asyncio
+async def test_total_completion_deadline_enforced_across_entire_stream(tmp_path, monkeypatch):
+    """
+    Verify that when total_completion_timeout_seconds=0.04 (40ms), upstream sends first chunk
+    immediately but waits 100ms before sending the rest, the gateway terminates the stream
+    with a deadline exceeded error chunk and does NOT count success.
+    """
+    test_db = str(tmp_path / "stream_deadline.db")
+    config = get_config().deep_copy()
+    config.db_path = test_db
+    config.server.gateway_api_key = ""
+    config.server.record_pid = False
+    config.server.total_completion_timeout_seconds = 0.04  # 40 ms deadline
+
+    await storage_db.init_db(test_db)
+    await storage_db.upsert_model(test_db, {
+        "id": "groq/slow-stream-model",
+        "provider": "groq",
+        "model_name": "slow-stream-model",
+        "context_length": 128000,
+        "is_free": True,
+        "is_active": True,
+        "latency_ms": 10.0,
+    })
+
+    app = create_app(config)
+    egress = app.state.egress_guard
+
+    async def slow_stream_post(*args, **kwargs):
+        # Chunk 1: sent immediately (so initial probe succeeds)
+        yield b'data: {"choices":[{"index": 0, "delta":{"content":"first chunk"}}]}\n\n'
+        # Chunk 2: delayed by 100ms > 40ms total deadline
+        await asyncio.sleep(0.10)
+        yield b'data: {"choices":[{"index": 0, "delta":{"content":"second chunk"}}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    monkeypatch.setattr(egress, "stream_post", slow_stream_post)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "groq/slow-stream-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        body_text = resp.text
+        # Error chunk must be emitted
+        assert "stream_timeout" in body_text or "deadline exceeded" in body_text.lower()
+        # Second chunk must NOT be forwarded as successful completion
+        # Success count in DB must be 0
+        m = await storage_db.get_model_by_id(test_db, "groq/slow-stream-model")
+        assert m["success_count"] == 0
+
+
 # =========================================================================
 # Fix 3: P2 — Tool Arguments Invalid JSON Rejected
 # =========================================================================
@@ -233,6 +287,53 @@ async def test_invalid_upstream_tool_arguments_json_rejected_streaming(hardening
         body_text = resp.text
         # Error event must be emitted
         assert "stream_error" in body_text or "Invalid upstream tool arguments JSON" in body_text
+        # Metrics must NOT count as success
+        m = await storage_db.get_model_by_id(test_db, "groq/test-model")
+        assert m["success_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_upstream_tool_arguments_json_rejected_on_done_without_finish_reason(hardening_env, monkeypatch):
+    """
+    Verify that when upstream returns invalid JSON in tool arguments and immediately sends [DONE]
+    WITHOUT finish_reason, flush_all_remaining() rejects the invalid JSON with allow_raw_string=False,
+    emits an error chunk, does NOT forward raw 'not-json', and does NOT record success.
+    """
+    app, config, test_db = hardening_env
+    egress = app.state.egress_guard
+
+    async def mock_stream_post(*args, **kwargs):
+        # Chunk 1: tool call with not-json arguments, NO finish_reason
+        chunk = {
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "not-json"},
+                    }]
+                },
+                "finish_reason": None,
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+        # Immediately terminate with [DONE]
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(egress, "stream_post", mock_stream_post)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"model": "groq/test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status_code == 200
+        body_text = resp.text
+        # Error event must be emitted
+        assert "Invalid upstream tool arguments JSON" in body_text or "stream_error" in body_text
+        # Raw 'not-json' arguments must NOT be forwarded as valid arguments
+        assert '"arguments": "not-json"' not in body_text
         # Metrics must NOT count as success
         m = await storage_db.get_model_by_id(test_db, "groq/test-model")
         assert m["success_count"] == 0
