@@ -115,23 +115,47 @@ def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 150
 
     remaining_budget = max_chars - sys_len
 
-    kept_reversed: List[Dict[str, Any]] = []
+    # Group working messages into atomic interaction blocks (N06)
+    # An assistant message with tool_calls and all consecutive following tool messages
+    # form a single atomic block so that tool_calls are never split from tool results.
+    blocks: List[List[Dict[str, Any]]] = []
+    i = 0
+    n = len(working_msgs)
+    while i < n:
+        m = working_msgs[i]
+        role = m.get("role")
+        tc = m.get("tool_calls")
+        if role == "assistant" and tc and isinstance(tc, list):
+            block = [m]
+            i += 1
+            while i < n and working_msgs[i].get("role") == "tool":
+                block.append(working_msgs[i])
+                i += 1
+            blocks.append(block)
+        else:
+            blocks.append([m])
+            i += 1
+
+    kept_blocks: List[List[Dict[str, Any]]] = []
     current_used = 0
 
-    if working_msgs:
-        last_m = working_msgs[-1]
-        kept_reversed.append(last_m)
-        current_used += msg_len(last_m)
-
-    for m in reversed(working_msgs[:-1]):
-        l = msg_len(m)
-        if current_used + l <= remaining_budget:
-            kept_reversed.append(m)
-            current_used += l
+    # Retain blocks from most recent to oldest
+    for block in reversed(blocks):
+        block_len = sum(msg_len(m) for m in block)
+        if not kept_blocks:
+            kept_blocks.append(block)
+            current_used += block_len
+        elif current_used + block_len <= remaining_budget:
+            kept_blocks.append(block)
+            current_used += block_len
         else:
             break
 
-    kept_forward = list(reversed(kept_reversed))
+    kept_forward: List[Dict[str, Any]] = []
+    for block in reversed(kept_blocks):
+        kept_forward.extend(block)
+
+    # Discard any leading orphan tool messages if present at the start of kept messages
     while kept_forward and kept_forward[0].get("role") == "tool":
         kept_forward.pop(0)
 

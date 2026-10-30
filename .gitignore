@@ -16,21 +16,35 @@ config/.env
 .env
 *.env
 
-# Local SQLite Storage & Databases
-storage/*.db
-storage/*.sqlite3
+# Local SQLite Storage, WAL, SHM & Journals (N07)
+storage/*
+!storage/.gitkeep
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
-# Testing & Coverage
+# Runtime logs & Instance Metadata (N05, N07)
+storage/*.log
+*.log
+.gateway.pid
+.gateway.instance.json
+.gateway.lock
+*.lock
+.test_lock
+
+# Testing & Coverage Artifacts
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+temp_test_run/
 
 # IDE & OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-.gateway.pid

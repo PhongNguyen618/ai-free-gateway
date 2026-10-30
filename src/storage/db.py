@@ -416,6 +416,24 @@ async def insert_pending_approval(db_path: str, data: Dict[str, Any]) -> None:
         await conn.commit()
 
 
+async def expire_pending_approval(db_path: str, approval_id: str) -> bool:
+    """
+    Atomically transition pending approval to expired ONLY if expires_at <= now (N03).
+    """
+    now_iso = _now_iso()
+    async with get_db(db_path) as conn:
+        cursor = await conn.execute(
+            """
+            UPDATE pending_approvals
+            SET status = 'expired'
+            WHERE id = ? AND status = 'pending' AND expires_at <= ?
+            """,
+            (approval_id, now_iso),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
 async def update_pending_approval_status(
     db_path: str,
     approval_id: str,
@@ -427,7 +445,16 @@ async def update_pending_approval_status(
     """
     now_iso = _now_iso()
     async with get_db(db_path) as conn:
-        if require_unexpired:
+        if status == "expired":
+            cursor = await conn.execute(
+                """
+                UPDATE pending_approvals
+                SET status = 'expired'
+                WHERE id = ? AND status = 'pending' AND expires_at <= ?
+                """,
+                (approval_id, now_iso),
+            )
+        elif require_unexpired or status in ("approved", "rejected"):
             cursor = await conn.execute(
                 """
                 UPDATE pending_approvals
@@ -471,7 +498,7 @@ async def get_pending_approvals(db_path: str) -> List[Dict[str, Any]]:
     async with get_db(db_path) as conn:
         # Auto expire timed out pending rows
         await conn.execute(
-            "UPDATE pending_approvals SET status = 'expired' WHERE status = 'pending' AND expires_at < ?",
+            "UPDATE pending_approvals SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
             (now_iso,)
         )
         await conn.commit()

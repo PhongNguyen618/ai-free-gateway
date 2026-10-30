@@ -6,13 +6,15 @@ import json
 import logging
 import secrets
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Set, Tuple, Union
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, ValidationError
 
-from src.config_loader import AppConfig
+from src.config_loader import AppConfig, get_provider_api_key
 from src.discovery.harvester import ModelHarvester
 from src.router.balancer import (
     ModelBalancer,
@@ -26,6 +28,119 @@ from src.security.sanitizer import DLPSanitizer, StreamingRestorer, UnsupportedM
 from src.storage import db as storage_db
 
 logger = logging.getLogger("ai_free_gateway.openai_proxy")
+
+
+class AdmissionLimitExceeded(Exception):
+    def __init__(self, message: str, retry_after: int = 2):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class InvalidUpstreamToolArgumentsError(Exception):
+    pass
+
+
+class CompletionAdmissionController:
+    """
+    Manages concurrent completion execution slots and pending HITL approval slots.
+    Guarantees non-completion endpoints (health, stats, decision) remain unblocked.
+    """
+    def __init__(self, max_concurrent_completions: int = 8, max_pending_approvals: int = 32):
+        self.max_completions = max_concurrent_completions
+        self.max_approvals = max_pending_approvals
+        self._active_completions = 0
+        self._active_approvals = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def active_completions(self) -> int:
+        return self._active_completions
+
+    @property
+    def active_approvals(self) -> int:
+        return self._active_approvals
+
+    async def acquire_completion(self) -> None:
+        async with self._lock:
+            if self._active_completions >= self.max_completions:
+                raise AdmissionLimitExceeded(
+                    "Gateway overloaded: maximum concurrent completions reached", retry_after=2
+                )
+            self._active_completions += 1
+
+    async def release_completion(self) -> None:
+        async with self._lock:
+            if self._active_completions > 0:
+                self._active_completions -= 1
+
+    async def enter_approval(self) -> None:
+        """
+        Transition request from active completion to waiting approval.
+        Releases completion slot to prevent deadlock during human deliberation.
+        """
+        async with self._lock:
+            if self._active_approvals >= self.max_approvals:
+                raise AdmissionLimitExceeded(
+                    "Gateway overloaded: maximum pending approvals reached", retry_after=5
+                )
+            self._active_approvals += 1
+            if self._active_completions > 0:
+                self._active_completions -= 1
+
+    async def exit_approval_and_reacquire_completion(self) -> None:
+        """
+        Human approval granted: release approval slot and re-acquire completion slot.
+        """
+        async with self._lock:
+            if self._active_approvals > 0:
+                self._active_approvals -= 1
+            if self._active_completions >= self.max_completions:
+                raise AdmissionLimitExceeded(
+                    "Gateway overloaded: unable to resume completion after approval", retry_after=2
+                )
+            self._active_completions += 1
+
+    async def exit_approval_finally(self) -> None:
+        """Release approval slot when rejected or expired without continuing upstream."""
+        async with self._lock:
+            if self._active_approvals > 0:
+                self._active_approvals -= 1
+
+
+def restore_json_structure(val: Any, reverse_map: Dict[str, str]) -> Any:
+    """Recursively restore string values in parsed JSON structure."""
+    if isinstance(val, str):
+        return DLPSanitizer.restore_text(val, reverse_map)
+    elif isinstance(val, dict):
+        return {k: restore_json_structure(v, reverse_map) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [restore_json_structure(item, reverse_map) for item in val]
+    return val
+
+
+def restore_tool_arguments_json(
+    raw_args: str,
+    reverse_map: Dict[str, str],
+    allow_raw_string: bool = False,
+) -> str:
+    """
+    Parse tool arguments as JSON, restore string values recursively, and re-serialize.
+    Ensures quotes/backslashes/newlines in restored secrets never break JSON syntax.
+    If allow_raw_string is True and raw_args is not valid JSON (e.g. fragments or mock strings),
+    falls back to text restoration.
+    """
+    if not raw_args:
+        return raw_args
+    try:
+        parsed = json.loads(raw_args)
+        if reverse_map:
+            restored = restore_json_structure(parsed, reverse_map)
+            return json.dumps(restored, ensure_ascii=False)
+        return raw_args
+    except Exception as e:
+        if allow_raw_string:
+            return DLPSanitizer.restore_text(raw_args, reverse_map) if reverse_map else raw_args
+        raise InvalidUpstreamToolArgumentsError(f"Upstream tool arguments is not valid JSON: {e}")
 
 
 class ContentPart(BaseModel):
@@ -115,12 +230,15 @@ def make_openai_error(
     error_type: str = "invalid_request_error",
     code: Optional[str] = None,
     param: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     err: Dict[str, Any] = {"message": message, "type": error_type}
     if param:
         err["param"] = param
     if code:
         err["code"] = code
+    if correlation_id:
+        err["correlation_id"] = correlation_id
     return {"error": err}
 
 
@@ -132,6 +250,11 @@ def create_openai_router(
     harvester: ModelHarvester,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["OpenAI Compatible Proxy"])
+    admission_controller = CompletionAdmissionController(
+        max_concurrent_completions=config.server.max_concurrent_completions,
+        max_pending_approvals=config.server.max_pending_approvals,
+    )
+    router.admission_controller = admission_controller  # type: ignore[attr-defined]
     sanitizer = DLPSanitizer(
         entropy_threshold=config.dlp.entropy_scan.threshold,
         entropy_min_length=config.dlp.entropy_scan.min_length,
@@ -155,7 +278,18 @@ def create_openai_router(
         elif x_gateway_key:
             provided_token = x_gateway_key.strip()
 
-        if not provided_token or not secrets.compare_digest(provided_token, expected_key):
+        try:
+            if not provided_token or not secrets.compare_digest(
+                provided_token.encode("utf-8", errors="replace"),
+                expected_key.encode("utf-8", errors="replace"),
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=make_openai_error("Invalid or missing Gateway API key", "authentication_error"),
+                )
+        except HTTPException:
+            raise
+        except Exception:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=make_openai_error("Invalid or missing Gateway API key", "authentication_error"),
@@ -226,478 +360,799 @@ def create_openai_router(
 
     @router.post("/chat/completions", dependencies=[Depends(verify_gateway_auth)])
     async def chat_completions(request: Request) -> Response:
-        # 1. Parse and strictly validate request body (R2-01, R2-04)
+        correlation_id = request.headers.get("X-Correlation-ID") or secrets.token_hex(8)
         try:
-            raw_body = await request.json()
-        except Exception:
+            await admission_controller.acquire_completion()
+        except AdmissionLimitExceeded as ale:
             return JSONResponse(
-                status_code=400,
-                content=make_openai_error("Malformed JSON in request body", "invalid_request_error", code="invalid_json"),
-            )
-
-        if not isinstance(raw_body, dict):
-            return JSONResponse(
-                status_code=400,
-                content=make_openai_error("Request body must be a JSON object", "invalid_request_error"),
-            )
-
-        # Explicit rejection for legacy functions to prevent bypass
-        if "functions" in raw_body:
-            return JSONResponse(
-                status_code=400,
+                status_code=429,
                 content=make_openai_error(
-                    "Legacy parameter 'functions' is unsupported; use standard 'tools' schema instead",
-                    "invalid_request_error",
-                    param="functions",
-                    code="unsupported_parameter",
+                    "Gateway overloaded. Please retry later.",
+                    "rate_limit_error",
+                    code="gateway_overloaded",
+                    correlation_id=correlation_id,
                 ),
+                headers={"Retry-After": str(ale.retry_after), "X-Correlation-ID": correlation_id},
             )
+
+        held_completion_slot = True
+        held_approval_slot = False
 
         try:
-            validated = ChatCompletionRequest(**raw_body)
-        except ValidationError as ve:
-            errors = ve.errors()
-            first_err = errors[0] if errors else {}
-            loc_parts = first_err.get("loc", [])
-            loc_str = ".".join(str(p) for p in loc_parts)
-            msg = first_err.get("msg", "Validation error")
-            # Strictly avoid echoing raw input value in error message
-            clean_msg = f"Invalid request parameter at '{loc_str}': {msg}"
-            return JSONResponse(
-                status_code=400,
-                content=make_openai_error(clean_msg, "invalid_request_error", param=loc_str, code="invalid_value"),
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=400,
-                content=make_openai_error(f"Invalid request parameters: {e}", "invalid_request_error"),
-            )
+            # 1. Parse and strictly validate request body with size gating (N01)
+            cl_header = request.headers.get("content-length")
+            if cl_header:
+                try:
+                    if int(cl_header) > config.server.max_body_bytes:
+                        return JSONResponse(
+                            status_code=413,
+                            content=make_openai_error(
+                                "Request body exceeds maximum allowed size",
+                                "invalid_request_error",
+                                code="payload_too_large",
+                            ),
+                        )
+                except ValueError:
+                    pass
 
-        client_ip = request.client.host if request.client else "127.0.0.1"
-        requested_model = validated.model
-        is_stream = bool(validated.stream)
+            body_chunks: List[bytes] = []
+            total_read_bytes = 0
+            async for chunk in request.stream():
+                total_read_bytes += len(chunk)
+                if total_read_bytes > config.server.max_body_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content=make_openai_error(
+                            "Request body exceeds maximum allowed size",
+                            "invalid_request_error",
+                            code="payload_too_large",
+                        ),
+                    )
+                body_chunks.append(chunk)
 
-        # Prepare normalized message and tool representations preserving protocol IDs (R2-03)
-        messages_data: List[Dict[str, Any]] = []
-        for m in validated.messages:
-            msg_dict: Dict[str, Any] = {"role": m.role}
-            if m.content is not None:
-                if isinstance(m.content, str):
-                    msg_dict["content"] = m.content
-                else:
-                    msg_dict["content"] = [p.model_dump(exclude_none=True) for p in m.content]
-            else:
-                msg_dict["content"] = None
-
-            if m.name is not None:
-                msg_dict["name"] = m.name
-            if m.tool_calls is not None:
-                msg_dict["tool_calls"] = [tc.model_dump(exclude_none=True) for tc in m.tool_calls]
-            if m.tool_call_id is not None:
-                msg_dict["tool_call_id"] = m.tool_call_id
-            if m.reasoning_content is not None:
-                msg_dict["reasoning_content"] = m.reasoning_content
-
-            messages_data.append(msg_dict)
-
-        tools_data = (
-            [t.model_dump(exclude_none=True) for t in validated.tools]
-            if validated.tools is not None
-            else None
-        )
-
-        # 2. DLP Scan & Dual Projections: Outbound vs Audit (R2-02, R2-03)
-        risk_actions = {
-            "HIGH": config.dlp.risk_action.high,
-            "MEDIUM": config.dlp.risk_action.medium,
-            "LOW": config.dlp.risk_action.low,
-        }
-
-        try:
-            if config.dlp.enabled:
-                res = sanitizer.sanitize_messages(
-                    messages=messages_data,
-                    tools=tools_data,
-                    risk_actions=risk_actions,
-                )
-                outbound_messages = res.outbound_messages
-                audit_messages = res.audit_messages
-                outbound_tools = res.outbound_tools
-                audit_tools = res.audit_tools
-                findings = res.all_findings
-                reverse_map = res.reverse_map
-                max_risk = res.overall_max_risk
-                audit_prompt_snippet = res.audit_prompt_snippet
-            else:
-                outbound_messages = messages_data
-                audit_messages = messages_data
-                outbound_tools = tools_data
-                audit_tools = tools_data
-                findings = []
-                reverse_map = {}
-                max_risk = "NONE"
-                audit_prompt_snippet = ""
-                for msg in messages_data:
-                    c = msg.get("content")
-                    if isinstance(c, str) and c:
-                        audit_prompt_snippet = c[:150]
-                        break
-        except UnsupportedModalityError as ume:
-            return JSONResponse(
-                status_code=400,
-                content=make_openai_error(str(ume), "invalid_request_error"),
-            )
-
-        # Audit findings representation (never contains raw secret values)
-        findings_dict_list = [
-            {
-                "rule_name": f.rule_name,
-                "entity_type": f.entity_type,
-                "risk_level": f.risk_level,
-                "redacted_token": f.redacted_token,
-                "masked_value": f.masked_value,
-            }
-            for f in findings
-        ]
-
-        # 3. Policy Coordination & Human-in-the-Loop Approval Gate (R2-08)
-        action_taken: Optional[str] = None
-
-        if config.dlp.enabled and findings:
-            # Step A: Check for any finding that requires 'reject' -> block immediately
-            has_reject = False
-            reject_risk = "NONE"
-            for f in findings:
-                if risk_actions.get(f.risk_level) == "reject":
-                    has_reject = True
-                    if f.risk_level == "HIGH" or reject_risk == "NONE":
-                        reject_risk = f.risk_level
-
-            if has_reject:
-                block_act = f"BLOCKED_{reject_risk}_RISK"
-                await storage_db.insert_dlp_log(config.db_path, {
-                    "client_ip": client_ip,
-                    "direction": "request",
-                    "risk_level": max_risk,
-                    "findings": findings_dict_list,
-                    "redaction_count": len(findings),
-                    "action_taken": block_act,
-                    "prompt_snippet": audit_prompt_snippet,
-                })
+            raw_bytes = b"".join(body_chunks)
+            try:
+                raw_body = json.loads(raw_bytes)
+            except Exception:
                 return JSONResponse(
-                    status_code=403,
+                    status_code=400,
+                    content=make_openai_error("Malformed JSON in request body", "invalid_request_error", code="invalid_json"),
+                )
+
+            if not isinstance(raw_body, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content=make_openai_error("Request body must be a JSON object", "invalid_request_error"),
+                )
+
+            # Explicit rejection for legacy functions to prevent bypass
+            if "functions" in raw_body:
+                return JSONResponse(
+                    status_code=400,
                     content=make_openai_error(
-                        "Request blocked by Zero-Trust DLP policy: sensitive data violation.",
-                        "dlp_violation",
-                        code="policy_violation",
+                        "Legacy parameter 'functions' is unsupported; use standard 'tools' schema instead",
+                        "invalid_request_error",
+                        param="functions",
+                        code="unsupported_parameter",
                     ),
                 )
 
-            # Step B: Check for any finding that requires 'approve' -> exactly one approval request
-            findings_needing_approval = [
-                f for f in findings if risk_actions.get(f.risk_level) == "approve"
-            ]
-            if findings_needing_approval:
-                approval_risk = "HIGH" if any(f.risk_level == "HIGH" for f in findings_needing_approval) else "MEDIUM"
-                app_id = await approval_gate.create_request(
-                    risk_level=approval_risk,
-                    client_ip=client_ip,
-                    model_requested=requested_model,
-                    findings=findings_dict_list,
-                    sanitized_messages=audit_messages,
-                    sanitized_payload={"model": requested_model, "messages": audit_messages},
-                    timeout_seconds=config.dlp.approval_timeout_seconds,
+            try:
+                validated = ChatCompletionRequest(**raw_body)
+            except ValidationError as ve:
+                errors = ve.errors()
+                first_err = errors[0] if errors else {}
+                loc_parts = first_err.get("loc", [])
+                loc_str = ".".join(str(p) for p in loc_parts)
+                msg = first_err.get("msg", "Validation error")
+                # Strictly avoid echoing raw input value in error message
+                clean_msg = f"Invalid request parameter at '{loc_str}': {msg}"
+                return JSONResponse(
+                    status_code=400,
+                    content=make_openai_error(clean_msg, "invalid_request_error", param=loc_str, code="invalid_value"),
                 )
-                decision, _ = await approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=400,
+                    content=make_openai_error(f"Invalid request parameters: {e}", "invalid_request_error"),
+                )
 
-                if decision == "approved":
-                    action_taken = "APPROVED_BY_ADMIN"
-                elif decision == "expired" and config.dlp.approval_timeout_action == "redact":
-                    action_taken = "TIMEOUT_AUTO_REDACTED"
-                    # Forward completely redacted version
-                    outbound_messages = audit_messages
-                    outbound_tools = audit_tools
+            # Control fields and protocol identifiers cannot be safely pseudonymized.
+            # Inspect them before any persistence; message/tool text follows the normal policy.
+            if config.dlp.enabled:
+                def inspect_boundary(value: Any, scan_values: bool = True) -> bool:
+                    if isinstance(value, str):
+                        return bool(sanitizer.sanitize_text(value).findings) if scan_values else False
+                    if isinstance(value, list):
+                        return any(inspect_boundary(item, scan_values) for item in value)
+                    if isinstance(value, dict):
+                        return any(
+                            bool(sanitizer.sanitize_text(key).findings)
+                            or inspect_boundary(item, scan_values or key in {"name", "id", "tool_call_id"})
+                            for key, item in value.items()
+                        )
+                    return False
+
+                normalized = validated.model_dump(exclude_none=True)
+                if any(inspect_boundary(value, key not in {"messages", "tools"})
+                       for key, value in normalized.items()):
+                    return JSONResponse(
+                        status_code=403,
+                        content=make_openai_error(
+                            "Sensitive data in control fields or protocol identifiers is not permitted.",
+                            "dlp_violation", code="policy_violation",
+                        ),
+                    )
+
+            client_ip = request.client.host if request.client else "127.0.0.1"
+            requested_model = validated.model
+            is_stream = bool(validated.stream)
+
+            # Prepare normalized message and tool representations preserving protocol IDs (R2-03)
+            messages_data: List[Dict[str, Any]] = []
+            for m in validated.messages:
+                msg_dict: Dict[str, Any] = {"role": m.role}
+                if m.content is not None:
+                    if isinstance(m.content, str):
+                        msg_dict["content"] = m.content
+                    else:
+                        msg_dict["content"] = [p.model_dump(exclude_none=True) for p in m.content]
                 else:
-                    act_decision = "REJECTED_BY_ADMIN" if decision == "rejected" else "EXPIRED"
+                    msg_dict["content"] = None
+
+                if m.name is not None:
+                    msg_dict["name"] = m.name
+                if m.tool_calls is not None:
+                    msg_dict["tool_calls"] = [tc.model_dump(exclude_none=True) for tc in m.tool_calls]
+                if m.tool_call_id is not None:
+                    msg_dict["tool_call_id"] = m.tool_call_id
+                if m.reasoning_content is not None:
+                    msg_dict["reasoning_content"] = m.reasoning_content
+
+                messages_data.append(msg_dict)
+
+            tools_data = (
+                [t.model_dump(exclude_none=True) for t in validated.tools]
+                if validated.tools is not None
+                else None
+            )
+
+            # 2. DLP Scan & Dual Projections: Outbound vs Audit (R2-02, R2-03)
+            risk_actions = {
+                "HIGH": config.dlp.risk_action.high,
+                "MEDIUM": config.dlp.risk_action.medium,
+                "LOW": config.dlp.risk_action.low,
+            }
+
+            try:
+                if config.dlp.enabled:
+                    res = sanitizer.sanitize_messages(
+                        messages=messages_data,
+                        tools=tools_data,
+                        risk_actions=risk_actions,
+                    )
+                    outbound_messages = res.outbound_messages
+                    audit_messages = res.audit_messages
+                    outbound_tools = res.outbound_tools
+                    audit_tools = res.audit_tools
+                    findings = res.all_findings
+                    reverse_map = res.reverse_map
+                    max_risk = res.overall_max_risk
+                    audit_prompt_snippet = res.audit_prompt_snippet
+                else:
+                    outbound_messages = messages_data
+                    audit_messages = messages_data
+                    outbound_tools = tools_data
+                    audit_tools = tools_data
+                    findings = []
+                    reverse_map = {}
+                    max_risk = "NONE"
+                    audit_prompt_snippet = ""
+                    for msg in messages_data:
+                        c = msg.get("content")
+                        if isinstance(c, str) and c:
+                            audit_prompt_snippet = c[:150]
+                            break
+            except UnsupportedModalityError as ume:
+                return JSONResponse(
+                    status_code=400,
+                    content=make_openai_error(str(ume), "invalid_request_error"),
+                )
+
+            # Audit findings representation (never contains raw secret values)
+            findings_dict_list = [
+                {
+                    "rule_name": f.rule_name,
+                    "entity_type": f.entity_type,
+                    "risk_level": f.risk_level,
+                    "redacted_token": f.redacted_token,
+                    "masked_value": f.masked_value,
+                }
+                for f in findings
+            ]
+
+            # 3. Policy Coordination & Human-in-the-Loop Approval Gate (R2-08)
+            action_taken: Optional[str] = None
+
+            if config.dlp.enabled and findings:
+                # Step A: Check for any finding that requires 'reject' -> block immediately
+                has_reject = False
+                reject_risk = "NONE"
+                for f in findings:
+                    if risk_actions.get(f.risk_level) == "reject":
+                        has_reject = True
+                        if f.risk_level == "HIGH" or reject_risk == "NONE":
+                            reject_risk = f.risk_level
+
+                if has_reject:
+                    block_act = f"BLOCKED_{reject_risk}_RISK"
                     await storage_db.insert_dlp_log(config.db_path, {
                         "client_ip": client_ip,
                         "direction": "request",
                         "risk_level": max_risk,
                         "findings": findings_dict_list,
                         "redaction_count": len(findings),
-                        "action_taken": act_decision,
+                        "action_taken": block_act,
                         "prompt_snippet": audit_prompt_snippet,
                     })
                     return JSONResponse(
                         status_code=403,
                         content=make_openai_error(
-                            f"Request {decision} by Human-in-the-Loop policy gate.",
-                            "approval_rejected",
-                            code="approval_rejected",
+                            "Request blocked by Zero-Trust DLP policy: sensitive data violation.",
+                            "dlp_violation",
+                            code="policy_violation",
                         ),
                     )
 
-        # Determine audit action label if not set by approval gate
-        if action_taken is None:
-            if not findings:
-                action_taken = "ALLOWED"
-            elif any(risk_actions.get(f.risk_level) == "redact" for f in findings):
-                action_taken = "REDACTED"
-            else:
-                action_taken = "ALLOWED"
+                # Step B: Check for any finding that requires 'approve' -> exactly one approval request
+                findings_needing_approval = [
+                    f for f in findings if risk_actions.get(f.risk_level) == "approve"
+                ]
+                if findings_needing_approval:
+                    # Release completion slot and acquire approval slot to prevent deadlocks (N01)
+                    held_completion_slot = False
+                    held_approval_slot = True
+                    try:
+                        await admission_controller.enter_approval()
+                    except AdmissionLimitExceeded as ale:
+                        held_approval_slot = False
+                        return JSONResponse(
+                            status_code=429,
+                            content=make_openai_error(
+                                "Gateway overloaded. Too many pending approvals.",
+                                "rate_limit_error",
+                                code="gateway_overloaded",
+                            ),
+                            headers={"Retry-After": str(ale.retry_after)},
+                        )
 
-        # Record audit log (strictly using audit projection with redacted snippet)
-        redact_count = len([f for f in findings if risk_actions.get(f.risk_level) == "redact"])
-        await storage_db.insert_dlp_log(config.db_path, {
-            "client_ip": client_ip,
-            "direction": "request",
-            "risk_level": max_risk,
-            "findings": findings_dict_list,
-            "redaction_count": redact_count,
-            "action_taken": action_taken,
-            "prompt_snippet": audit_prompt_snippet,
-        })
+                    approval_risk = "HIGH" if any(f.risk_level == "HIGH" for f in findings_needing_approval) else "MEDIUM"
+                    app_id = await approval_gate.create_request(
+                        risk_level=approval_risk,
+                        client_ip=client_ip,
+                        model_requested=requested_model,
+                        findings=findings_dict_list,
+                        sanitized_messages=audit_messages,
+                        sanitized_payload={"model": requested_model, "messages": audit_messages},
+                        timeout_seconds=config.dlp.approval_timeout_seconds,
+                    )
+                    async def _watch_client_disconnect() -> bool:
+                        while True:
+                            try:
+                                if await request.is_disconnected():
+                                    return True
+                            except Exception:
+                                return False
+                            await asyncio.sleep(0.5)
 
-        # 4. Construct outbound payload from validated schema and sanitized output (R2-01)
-        outgoing_payload: Dict[str, Any] = {
-            "model": requested_model,
-            "messages": outbound_messages,
-        }
-        if validated.stream is not None:
-            outgoing_payload["stream"] = validated.stream
-        if outbound_tools is not None:
-            outgoing_payload["tools"] = outbound_tools
-        if validated.tool_choice is not None:
-            outgoing_payload["tool_choice"] = validated.tool_choice
-        if validated.parallel_tool_calls is not None:
-            outgoing_payload["parallel_tool_calls"] = validated.parallel_tool_calls
-        if validated.max_tokens is not None:
-            outgoing_payload["max_tokens"] = validated.max_tokens
-        if validated.max_completion_tokens is not None:
-            outgoing_payload["max_completion_tokens"] = validated.max_completion_tokens
-        if validated.temperature is not None:
-            outgoing_payload["temperature"] = validated.temperature
-        if validated.top_p is not None:
-            outgoing_payload["top_p"] = validated.top_p
-        if validated.stop is not None:
-            outgoing_payload["stop"] = validated.stop
-        if validated.n is not None:
-            outgoing_payload["n"] = validated.n
-        if validated.seed is not None:
-            outgoing_payload["seed"] = validated.seed
-        if validated.stream_options is not None:
-            outgoing_payload["stream_options"] = validated.stream_options
-        if validated.response_format is not None:
-            outgoing_payload["response_format"] = validated.response_format
-        if validated.reasoning_effort is not None and validated.reasoning_effort.lower() in ("low", "medium", "high"):
-            outgoing_payload["reasoning_effort"] = validated.reasoning_effort.lower()
+                    wait_task = asyncio.create_task(
+                        approval_gate.wait_for_decision(app_id, config.dlp.approval_timeout_seconds)
+                    )
+                    disconnect_task = asyncio.create_task(_watch_client_disconnect())
 
-        # 5. Routing context budget & candidate chain lookup (R2-09)
-        estimated_tokens = estimate_payload_tokens(outgoing_payload)
+                    try:
+                        done, pending = await asyncio.wait(
+                            [wait_task, disconnect_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                            try:
+                                await t
+                            except (asyncio.CancelledError, Exception):
+                                pass
 
-        try:
-            candidates = await balancer.get_candidate_chain(
-                requested_model=requested_model,
-                prompt_text=audit_prompt_snippet,
-                estimated_tokens=estimated_tokens,
-            )
-        except ModelNotFoundError as mne:
-            return JSONResponse(
-                status_code=404,
-                content=make_openai_error(str(mne), "model_not_found", code="model_not_found"),
-            )
-        except ContextLengthExceededError as clee:
-            return JSONResponse(
-                status_code=400,
-                content=make_openai_error(str(clee), "invalid_request_error", code="context_length_exceeded"),
-            )
+                        if disconnect_task in done and disconnect_task.result() is True:
+                            # Client disconnected while waiting: cancel request and clean memory (N03)
+                            await approval_gate.cancel_request(app_id)
+                            held_approval_slot = False
+                            await admission_controller.exit_approval_finally()
+                            return Response(status_code=499)
 
-        if not candidates:
-            return JSONResponse(
-                status_code=503,
-                content=make_openai_error(
-                    "No available free models found in pool (all providers unconfigured, disabled, or in cooldown).",
-                    "service_unavailable",
-                ),
-            )
+                        decision, _ = wait_task.result()
+                    except Exception:
+                        wait_task.cancel()
+                        disconnect_task.cancel()
+                        held_approval_slot = False
+                        await admission_controller.exit_approval_finally()
+                        raise
 
-        last_error = None
-        failed_attempts: List[Dict[str, Any]] = []
-        cooldown_providers_in_request: Set[str] = set()
+                    if decision == "approved":
+                        # If client disconnected immediately after approval, halt before upstream (N03)
+                        if await request.is_disconnected():
+                            logger.info("Client disconnected after approval; halting before upstream.")
+                            held_approval_slot = False
+                            await admission_controller.exit_approval_finally()
+                            return Response(status_code=499)
 
-        # 6. Fallback routing loop with instant 429 provider skipping
-        for candidate in candidates:
-            provider = candidate["provider"]
+                        action_taken = "APPROVED_BY_ADMIN"
+                        held_approval_slot = False
+                        held_completion_slot = True
+                        try:
+                            await admission_controller.exit_approval_and_reacquire_completion()
+                        except AdmissionLimitExceeded as ale:
+                            held_completion_slot = False
+                            return JSONResponse(
+                                status_code=429,
+                                content=make_openai_error(
+                                    "Gateway overloaded. Please retry later.",
+                                    "rate_limit_error",
+                                    code="gateway_overloaded",
+                                ),
+                                headers={"Retry-After": str(ale.retry_after)},
+                            )
+                    elif decision == "expired" and config.dlp.approval_timeout_action == "redact":
+                        action_taken = "TIMEOUT_AUTO_REDACTED"
+                        held_approval_slot = False
+                        held_completion_slot = True
+                        try:
+                            await admission_controller.exit_approval_and_reacquire_completion()
+                        except AdmissionLimitExceeded as ale:
+                            held_completion_slot = False
+                            return JSONResponse(
+                                status_code=429,
+                                content=make_openai_error(
+                                    "Gateway overloaded. Please retry later.",
+                                    "rate_limit_error",
+                                    code="gateway_overloaded",
+                                ),
+                                headers={"Retry-After": str(ale.retry_after)},
+                            )
+                        # Forward completely redacted version
+                        outbound_messages = audit_messages
+                        outbound_tools = audit_tools
+                    else:
+                        held_approval_slot = False
+                        await admission_controller.exit_approval_finally()
+                        act_decision = "REJECTED_BY_ADMIN" if decision == "rejected" else "EXPIRED"
+                        await storage_db.insert_dlp_log(config.db_path, {
+                            "client_ip": client_ip,
+                            "direction": "request",
+                            "risk_level": max_risk,
+                            "findings": findings_dict_list,
+                            "redaction_count": len(findings),
+                            "action_taken": act_decision,
+                            "prompt_snippet": audit_prompt_snippet,
+                        })
+                        return JSONResponse(
+                            status_code=403,
+                            content=make_openai_error(
+                                f"Request {decision} by Human-in-the-Loop policy gate.",
+                                "approval_rejected",
+                                code="approval_rejected",
+                            ),
+                        )
 
-            if provider in cooldown_providers_in_request:
-                continue
+            # Determine audit action label if not set by approval gate
+            if action_taken is None:
+                if not findings:
+                    action_taken = "ALLOWED"
+                elif any(risk_actions.get(f.risk_level) == "redact" for f in findings):
+                    action_taken = "REDACTED"
+                else:
+                    action_taken = "ALLOWED"
 
-            if await storage_db.is_provider_in_cooldown(config.db_path, provider):
-                cooldown_providers_in_request.add(provider)
-                continue
+            # Record audit log (strictly using audit projection with redacted snippet)
+            redact_count = len([f for f in findings if risk_actions.get(f.risk_level) == "redact"])
+            await storage_db.insert_dlp_log(config.db_path, {
+                "client_ip": client_ip,
+                "direction": "request",
+                "risk_level": max_risk,
+                "findings": findings_dict_list,
+                "redaction_count": redact_count,
+                "action_taken": action_taken,
+                "prompt_snippet": audit_prompt_snippet,
+            })
 
-            target_url, headers, provider_payload = balancer.resolve_provider_request(
-                candidate, outgoing_payload
-            )
+            # 4. Construct outbound payload from validated schema and sanitized output (R2-01)
+            outgoing_payload: Dict[str, Any] = {
+                "model": requested_model,
+                "messages": outbound_messages,
+            }
+            if validated.stream is not None:
+                outgoing_payload["stream"] = validated.stream
+            if outbound_tools is not None:
+                outgoing_payload["tools"] = outbound_tools
+            if validated.tool_choice is not None:
+                outgoing_payload["tool_choice"] = validated.tool_choice
+            if validated.parallel_tool_calls is not None:
+                outgoing_payload["parallel_tool_calls"] = validated.parallel_tool_calls
+            if validated.max_tokens is not None:
+                outgoing_payload["max_tokens"] = validated.max_tokens
+            if validated.max_completion_tokens is not None:
+                outgoing_payload["max_completion_tokens"] = validated.max_completion_tokens
+            if validated.temperature is not None:
+                outgoing_payload["temperature"] = validated.temperature
+            if validated.top_p is not None:
+                outgoing_payload["top_p"] = validated.top_p
+            if validated.stop is not None:
+                outgoing_payload["stop"] = validated.stop
+            if validated.n is not None:
+                outgoing_payload["n"] = validated.n
+            if validated.seed is not None:
+                outgoing_payload["seed"] = validated.seed
+            if validated.stream_options is not None:
+                outgoing_payload["stream_options"] = validated.stream_options
+            if validated.response_format is not None:
+                outgoing_payload["response_format"] = validated.response_format
+            if validated.reasoning_effort is not None and validated.reasoning_effort.lower() in ("low", "medium", "high"):
+                outgoing_payload["reasoning_effort"] = validated.reasoning_effort.lower()
+
+            # 5. Routing context budget & candidate chain lookup (R2-09)
+            estimated_tokens = estimate_payload_tokens(outgoing_payload)
 
             try:
-                # --- CASE A: STREAMING (Server-Sent Events) (R2-06) ---
-                if is_stream:
-                    stream_gen = _handle_streaming_proxy(
-                        egress_guard=egress_guard,
-                        target_url=target_url,
-                        headers=headers,
-                        payload=provider_payload,
-                        candidate=candidate,
-                        reverse_map=reverse_map if config.dlp.pseudonymize_reversible else {},
-                        config=config,
-                    )
+                candidates = await balancer.get_candidate_chain(
+                    requested_model=requested_model,
+                    prompt_text=audit_prompt_snippet,
+                    estimated_tokens=estimated_tokens,
+                )
+            except ModelNotFoundError as mne:
+                return JSONResponse(
+                    status_code=404,
+                    content=make_openai_error(str(mne), "model_not_found", code="model_not_found"),
+                )
+            except ContextLengthExceededError as clee:
+                return JSONResponse(
+                    status_code=400,
+                    content=make_openai_error(str(clee), "invalid_request_error", code="context_length_exceeded"),
+                )
 
-                    # Probe first item to verify provider readiness before emitting HTTP 200
-                    try:
-                        first_chunk = await stream_gen.__anext__()
-                    except StopAsyncIteration:
-                        first_chunk = None
-                    except httpx.HTTPStatusError as e:
+            if not candidates:
+                return JSONResponse(
+                    status_code=503,
+                    content=make_openai_error(
+                        "No available free models found in pool (all providers unconfigured, disabled, or in cooldown).",
+                        "service_unavailable",
+                    ),
+                )
+
+            last_error = None
+            failed_attempts: List[Dict[str, Any]] = []
+            cooldown_providers_in_request: Set[str] = set()
+            failed_auth_providers: Set[str] = set()
+
+            start_candidates_time = time.perf_counter()
+            total_completion_deadline = config.server.total_completion_timeout_seconds
+            max_attempts = getattr(config.server, "max_attempts", 3)
+            attempt_count = 0
+            deadline_exceeded = False
+
+            # 6. Fallback routing loop with instant 429/401/403 skipping, attempt budget & total deadline (N01, N06)
+            for candidate in candidates:
+                elapsed_so_far = time.perf_counter() - start_candidates_time
+                remaining_time = total_completion_deadline - elapsed_so_far
+                if remaining_time <= 0:
+                    deadline_exceeded = True
+                    logger.warning("Total completion deadline exceeded before candidate execution.")
+                    break
+
+                if attempt_count >= max_attempts:
+                    logger.warning("Maximum fallback attempts reached (%d). Halting candidate loop.", max_attempts)
+                    break
+
+                provider = candidate["provider"]
+
+                if provider in cooldown_providers_in_request or provider in failed_auth_providers:
+                    continue
+
+                if await storage_db.is_provider_in_cooldown(config.db_path, provider):
+                    cooldown_providers_in_request.add(provider)
+                    continue
+
+                # Upfront credential check (N06):
+                # Candidate must have credential. Missing key must not send request without auth.
+                pcfg = getattr(config.providers, provider, None)
+                if pcfg and pcfg.api_key_env and not get_provider_api_key(provider, config):
+                    logger.debug("Provider %s requires API key %s but none is set. Skipping upfront.", provider, pcfg.api_key_env)
+                    failed_attempts.append({
+                        "id": candidate["id"],
+                        "provider": provider,
+                        "error": f"Provider {provider} API key ({pcfg.api_key_env}) is not configured",
+                    })
+                    continue
+
+                target_url, headers, provider_payload = balancer.resolve_provider_request(
+                    candidate, outgoing_payload
+                )
+
+                attempt_count += 1
+
+                try:
+                    # --- CASE A: STREAMING (Server-Sent Events) (R2-06, N01, N06) ---
+                    if is_stream:
+                        stream_gen = _handle_streaming_proxy(
+                            egress_guard=egress_guard,
+                            target_url=target_url,
+                            headers=headers,
+                            payload=provider_payload,
+                            candidate=candidate,
+                            reverse_map=reverse_map if config.dlp.pseudonymize_reversible else {},
+                            config=config,
+                        )
+
+                        # Probe first item to verify provider readiness before emitting HTTP 200, bounded by deadline
                         try:
-                            err_body = e.response.text if hasattr(e.response, "text") else str(e)
-                            Path("storage").mkdir(exist_ok=True)
-                            with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
-                                ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] HTTPStatusError {candidate['id']} ({provider}) HTTP {e.response.status_code}:\n{err_body}\n")
-                        except Exception:
-                            pass
-                        logger.error(f"Stream provider {provider} ({candidate['id']}) returned HTTP {e.response.status_code}: {e}")
-                        if e.response.status_code == 429:
-                            cooldown_providers_in_request.add(provider)
-                            cooldown_sec = _extract_cooldown_seconds(e.response, config, provider)
-                            await storage_db.set_provider_cooldown(
-                                config.db_path, provider, cooldown_sec, 429, "Rate limit exceeded"
+                            first_chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=remaining_time)
+                        except StopAsyncIteration:
+                            first_chunk = None
+                        except asyncio.TimeoutError:
+                            deadline_exceeded = True
+                            logger.warning("Stream probe for candidate %s timed out against total completion deadline.", candidate["id"])
+                            await storage_db.update_model_metrics(config.db_path, candidate["id"], total_completion_deadline * 1000.0, False)
+                            last_error = f"Total completion deadline ({total_completion_deadline}s) exceeded"
+                            failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                            break
+                        except httpx.HTTPStatusError as e:
+                            logger.error("Stream provider %s returned HTTP %s", provider, e.response.status_code)
+                            await storage_db.update_model_metrics(
+                                config.db_path, candidate["id"], 500.0, False
                             )
-                        await storage_db.update_model_metrics(
-                            config.db_path, candidate["id"], 500.0, False
+                            if e.response.status_code == 429:
+                                cooldown_providers_in_request.add(provider)
+                                cooldown_sec = _extract_cooldown_seconds(e.response, config, provider)
+                                await storage_db.set_provider_cooldown(
+                                    config.db_path, provider, cooldown_sec, 429, "Rate limit exceeded"
+                                )
+                                last_error = f"Stream provider {provider} returned HTTP 429"
+                                failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": 429, "error": last_error})
+                                continue
+                            elif e.response.status_code in (401, 403):
+                                failed_auth_providers.add(provider)
+                                last_error = f"Stream provider {provider} authentication failed (HTTP {e.response.status_code})"
+                                failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
+                                continue
+                            elif e.response.status_code in (400, 422):
+                                last_error = f"Stream provider {provider} rejected request parameters (HTTP {e.response.status_code})"
+                                failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
+                                # N06: 400/422 parameter/schema error: halt immediately without blind retries
+                                break
+                            else:
+                                last_error = f"Stream provider {provider} returned HTTP {e.response.status_code}"
+                                failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
+                                continue
+                        except Exception as e:
+                            logger.error("Stream provider %s connection failed (%s)", provider, type(e).__name__)
+                            await storage_db.update_model_metrics(
+                                config.db_path, candidate["id"], 500.0, False
+                            )
+                            last_error = f"Stream provider {provider} connection failed: {e.__class__.__name__}"
+                            failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                            continue
+
+                        if (time.perf_counter() - start_candidates_time) > total_completion_deadline:
+                            deadline_exceeded = True
+                            logger.warning("Stream probe for candidate %s completed after total completion deadline expired.", candidate["id"])
+                            await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                            last_error = f"Total completion deadline ({total_completion_deadline}s) exceeded"
+                            failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                            break
+
+                        if first_chunk is None:
+                            logger.warning("Stream candidate %s yielded empty stream before first chunk.", candidate["id"])
+                            await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                            last_error = "Empty upstream stream"
+                            failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                            continue
+
+                        # Stream succeeded initial probe: commit active model & return streaming response
+                        balancer.record_active_model(candidate, candidates, failed_attempts)
+
+                        async def stream_chained_wrapper(initial_item: Optional[bytes], rest_gen: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+                            try:
+                                if initial_item is not None:
+                                    yield initial_item
+                                async for item in rest_gen:
+                                    yield item
+                            finally:
+                                try:
+                                    await rest_gen.aclose()
+                                finally:
+                                    await admission_controller.release_completion()
+
+                        # Ownership of completion slot is transferred to the streaming response generator (N01)
+                        held_completion_slot = False
+
+                        return StreamingResponse(
+                            stream_chained_wrapper(first_chunk, stream_gen),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",
+                                "X-Correlation-ID": correlation_id,
+                            },
                         )
-                        last_error = f"Stream provider {provider} returned HTTP {e.response.status_code}"
-                        failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
+
+                    # --- CASE B: STANDARD JSON RESPONSE (N01, N06) ---
+                    try:
+                        resp = await asyncio.wait_for(
+                            egress_guard.post(target_url, headers=headers, json_data=provider_payload),
+                            timeout=remaining_time,
+                        )
+                    except asyncio.TimeoutError:
+                        deadline_exceeded = True
+                        logger.warning("Upstream call for candidate %s timed out against total completion deadline.", candidate["id"])
+                        await storage_db.update_model_metrics(config.db_path, candidate["id"], total_completion_deadline * 1000.0, False)
+                        last_error = f"Total completion deadline ({total_completion_deadline}s) exceeded"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                        break
+
+                    if (time.perf_counter() - start_candidates_time) > total_completion_deadline:
+                        deadline_exceeded = True
+                        logger.warning("Candidate %s completed after total completion deadline expired.", candidate["id"])
+                        await storage_db.update_model_metrics(config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False)
+                        last_error = f"Total completion deadline ({total_completion_deadline}s) exceeded"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                        break
+
+                    if resp.status_code == 429:
+                        cooldown_providers_in_request.add(provider)
+                        cooldown_sec = _extract_cooldown_seconds(resp, config, provider)
+                        await storage_db.set_provider_cooldown(
+                            config.db_path, provider, cooldown_sec, 429, "Rate limit exceeded"
+                        )
+                        await storage_db.update_model_metrics(
+                            config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
+                        )
+                        last_error = f"Provider {provider} returned HTTP 429"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": 429, "error": last_error})
                         continue
-                    except Exception as e:
-                        try:
-                            Path("storage").mkdir(exist_ok=True)
-                            with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
-                                ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Exception {candidate['id']} ({provider}) {type(e).__name__}: {e}\n")
-                        except Exception:
-                            pass
-                        logger.error(f"Stream provider {provider} ({candidate['id']}) connection failed: {type(e).__name__}: {e}")
+
+                    if resp.status_code in (401, 403):
+                        failed_auth_providers.add(provider)
                         await storage_db.update_model_metrics(
-                            config.db_path, candidate["id"], 500.0, False
+                            config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
                         )
-                        last_error = f"Stream provider {provider} connection failed: {e.__class__.__name__}"
+                        last_error = f"Provider {provider} authentication failed (HTTP {resp.status_code})"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": resp.status_code, "error": last_error})
+                        continue
+
+                    if resp.status_code in (400, 422):
+                        await storage_db.update_model_metrics(
+                            config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
+                        )
+                        last_error = f"Provider {provider} rejected request parameters (HTTP {resp.status_code})"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": resp.status_code, "error": last_error})
+                        # N06: 400/422 parameter/schema error: halt immediately without blind retries
+                        break
+
+                    if resp.status_code >= 400:
+                        await storage_db.update_model_metrics(
+                            config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
+                        )
+                        # Strictly sanitize upstream error: do not leak raw response text (R2-07)
+                        last_error = f"Provider {provider} returned HTTP {resp.status_code}"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": resp.status_code, "error": last_error})
+                        continue
+
+                    # Validate response JSON body and ChatCompletion structure before success
+                    try:
+                        resp_json = resp.json()
+                    except Exception as e:
+                        logger.error("Upstream candidate %s returned invalid non-JSON body: %s", candidate["id"], e)
+                        await storage_db.update_model_metrics(config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False)
+                        last_error = "Upstream returned non-JSON body"
                         failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
                         continue
 
-                    # Stream succeeded initial probe: commit active model & return streaming response
-                    await storage_db.update_model_metrics(config.db_path, candidate["id"], 150.0, True)
-                    balancer.record_active_model(candidate, candidates, failed_attempts)
+                    choices = resp_json.get("choices") if isinstance(resp_json, dict) else None
+                    if not isinstance(choices, list) or len(choices) == 0:
+                        logger.error("Upstream candidate %s returned invalid completion structure (missing or empty choices)", candidate["id"])
+                        await storage_db.update_model_metrics(config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False)
+                        last_error = "Upstream returned invalid completion structure (missing or empty choices)"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                        continue
 
-                    async def stream_chained_wrapper(initial_item: Optional[bytes], rest_gen: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-                        try:
-                            if initial_item is not None:
-                                yield initial_item
-                            async for item in rest_gen:
-                                yield item
-                        except (GeneratorExit, asyncio.CancelledError):
-                            pass
+                    valid_choices = True
+                    for choice in choices:
+                        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                            valid_choices = False
+                            break
 
-                    return StreamingResponse(
-                        stream_chained_wrapper(first_chunk, stream_gen),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no",
-                        },
-                    )
+                    if not valid_choices:
+                        logger.error("Upstream candidate %s returned malformed choice in completion", candidate["id"])
+                        await storage_db.update_model_metrics(config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False)
+                        last_error = "Upstream returned malformed choice in completion"
+                        failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                        continue
 
-                # --- CASE B: STANDARD JSON RESPONSE ---
-                resp = await egress_guard.post(target_url, headers=headers, json_data=provider_payload)
-
-                if resp.status_code == 429:
-                    cooldown_providers_in_request.add(provider)
-                    cooldown_sec = _extract_cooldown_seconds(resp, config, provider)
-                    await storage_db.set_provider_cooldown(
-                        config.db_path, provider, cooldown_sec, 429, "Rate limit exceeded"
-                    )
-                    await storage_db.update_model_metrics(
-                        config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
-                    )
-                    last_error = f"Provider {provider} returned HTTP 429"
-                    failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": 429, "error": last_error})
-                    continue
-
-                if resp.status_code >= 400:
-                    try:
-                        err_body = resp.text if hasattr(resp, "text") else ""
-                        Path("storage").mkdir(exist_ok=True)
-                        with open("storage/last_upstream_error.log", "a", encoding="utf-8") as ef:
-                            ef.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] JSON HTTP {resp.status_code} {candidate['id']} ({provider}):\n{err_body}\n")
-                    except Exception:
-                        pass
-                    await storage_db.update_model_metrics(
-                        config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
-                    )
-                    # Strictly sanitize upstream error: do not leak raw response text (R2-07)
-                    last_error = f"Provider {provider} returned HTTP {resp.status_code}"
-                    failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": resp.status_code, "error": last_error})
-                    continue
-
-                # Successful JSON execution
-                resp_json = resp.json()
-                latency_ms = getattr(resp, "latency_ms", 200.0)
-                await storage_db.update_model_metrics(config.db_path, candidate["id"], latency_ms, True)
-                # Extract token usage for quota tracking
-                usage = resp_json.get("usage", {})
-                tokens_used = usage.get("total_tokens", 0)
-                await storage_db.increment_provider_usage(config.db_path, provider, tokens_used)
-                await storage_db.update_model_metrics(config.db_path, candidate["id"], latency_ms, True, tokens_used=tokens_used)
-                balancer.record_active_model(candidate, candidates, failed_attempts, tokens_used=tokens_used)
-
-                # Reversible pseudonymization restoration in response (content + tool_calls arguments) (R2-03)
-                if config.dlp.pseudonymize_reversible and reverse_map:
-                    choices = resp_json.get("choices", [])
+                    # Validate tool arguments strictly as JSON and restore DLP pseudonymization (Bug 3 / N02)
                     for choice in choices:
                         msg = choice.get("message", {})
-                        if isinstance(msg.get("content"), str):
+                        if isinstance(msg.get("content"), str) and config.dlp.pseudonymize_reversible and reverse_map:
                             msg["content"] = DLPSanitizer.restore_text(msg["content"], reverse_map)
-                        if isinstance(msg.get("reasoning_content"), str):
+                        if isinstance(msg.get("reasoning_content"), str) and config.dlp.pseudonymize_reversible and reverse_map:
                             msg["reasoning_content"] = DLPSanitizer.restore_text(msg["reasoning_content"], reverse_map)
                         if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
                             for tc in msg["tool_calls"]:
-                                fn = tc.get("function", {})
-                                if "arguments" in fn and isinstance(fn["arguments"], str):
-                                    fn["arguments"] = DLPSanitizer.restore_text(fn["arguments"], reverse_map)
+                                if isinstance(tc, dict):
+                                    fn = tc.get("function", {})
+                                    raw_args = fn.get("arguments")
+                                    if isinstance(raw_args, str):
+                                        fn["arguments"] = restore_tool_arguments_json(
+                                            raw_args,
+                                            reverse_map if (config.dlp.pseudonymize_reversible and reverse_map) else {},
+                                            allow_raw_string=False,
+                                        )
 
-                return JSONResponse(content=resp_json)
+                    latency_ms = getattr(resp, "latency_ms", 200.0)
+                    # Extract token usage for quota tracking
+                    usage = resp_json.get("usage", {})
+                    tokens_used = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
+                    await storage_db.increment_provider_usage(config.db_path, provider, tokens_used)
+                    await storage_db.update_model_metrics(config.db_path, candidate["id"], latency_ms, True, tokens_used=tokens_used)
+                    balancer.record_active_model(candidate, candidates, failed_attempts, tokens_used=tokens_used)
 
-            except Exception as e:
-                logger.warning(f"Error calling candidate {candidate['id']}: {e.__class__.__name__}")
-                last_error = f"Candidate error: {e.__class__.__name__}"
-                failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
-                continue
+                    return JSONResponse(content=resp_json, headers={"X-Correlation-ID": correlation_id})
 
-        # All candidates failed (R2-07: Sanitized error response without leaking upstream payload)
-        return JSONResponse(
-            status_code=502,
-            content=make_openai_error(
-                "All free model fallbacks failed. Upstream providers unavailable.",
-                "bad_gateway",
-                code="bad_gateway",
-            ),
-        )
+                except InvalidUpstreamToolArgumentsError as itae:
+                    logger.error("Upstream candidate %s returned invalid tool arguments JSON: %s", candidate["id"], itae)
+                    await storage_db.update_model_metrics(config.db_path, candidate["id"], 500.0, False)
+                    last_error = "Invalid upstream tool arguments JSON"
+                    failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error calling candidate {candidate['id']}: {e.__class__.__name__}")
+                    last_error = f"Candidate error: {e.__class__.__name__}"
+                    failed_attempts.append({"id": candidate["id"], "provider": provider, "error": last_error})
+                    continue
+
+            # Check if total completion deadline was exceeded
+            if deadline_exceeded or (time.perf_counter() - start_candidates_time) >= total_completion_deadline:
+                return JSONResponse(
+                    status_code=504,
+                    content=make_openai_error(
+                        f"Gateway timeout: total completion deadline of {total_completion_deadline}s exceeded",
+                        "timeout_error",
+                        code="gateway_timeout",
+                        correlation_id=correlation_id,
+                    ),
+                    headers={"X-Correlation-ID": correlation_id},
+                )
+
+            # All candidates failed (R2-07: Sanitized error response without leaking upstream payload)
+            return JSONResponse(
+                status_code=502,
+                content=make_openai_error(
+                    "All free model fallbacks failed. Upstream providers unavailable.",
+                    "bad_gateway",
+                    code="bad_gateway",
+                    correlation_id=correlation_id,
+                ),
+                headers={"X-Correlation-ID": correlation_id},
+            )
+        finally:
+            if held_approval_slot:
+                await admission_controller.exit_approval_finally()
+            elif held_completion_slot:
+                await admission_controller.release_completion()
 
     return router
 
 
 def _extract_cooldown_seconds(resp: httpx.Response, config: AppConfig, provider: str) -> int:
-    """Parse Retry-After header if available, bounded between 1 and 3600 seconds."""
+    """Parse Retry-After header (seconds or HTTP date), bounded between 1 and 3600 seconds (N06)."""
     cooldown_sec = 300
     p_cfg = getattr(config.providers, provider, None)
     if p_cfg:
@@ -705,11 +1160,18 @@ def _extract_cooldown_seconds(resp: httpx.Response, config: AppConfig, provider:
 
     retry_after = resp.headers.get("retry-after")
     if retry_after:
+        raw_val = retry_after.strip()
         try:
-            val = int(retry_after.strip())
+            val = int(raw_val)
             return max(1, min(3600, val))
         except ValueError:
-            pass
+            try:
+                dt = parsedate_to_datetime(raw_val)
+                now = datetime.now(timezone.utc)
+                diff = int((dt - now).total_seconds())
+                return max(1, min(3600, diff))
+            except Exception:
+                pass
     return cooldown_sec
 
 
@@ -724,7 +1186,8 @@ async def _handle_streaming_proxy(
 ) -> AsyncIterator[bytes]:
     """
     Handles streaming responses with incremental UTF-8 decoding, per-choice and per-channel
-    StreamingRestorer, multi-line SSE grouping, and strict completion lifecycle verification.
+    StreamingRestorer, per (choice_idx, tool_idx) arguments buffering, multi-line SSE grouping,
+    strict terminal completion lifecycle, line/event/tool bounds, and configurable deadlines (N01, N02).
     """
     provider = candidate["provider"]
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -743,12 +1206,113 @@ async def _handle_streaming_proxy(
     actual_tokens_reported = None
     has_seen_done = False
     has_yielded = False
+    has_received_valid_completion = False
+    stream_failed = False
+    finished_choices: Set[int] = set()
+
+    # Per (choice_idx, tool_idx) arguments buffer
+    tool_args_buffer: Dict[Tuple[int, int], str] = {}
+
+    def flush_all_remaining() -> List[Dict[str, Any]]:
+        chunks_to_emit: List[Dict[str, Any]] = []
+        for (c_idx, chan, _), r in list(restorers.items()):
+            flushed = r.flush()
+            if flushed:
+                if chan == "content":
+                    chunks_to_emit.append({
+                        "id": "chatcmpl-stream",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": candidate["model_name"],
+                        "choices": [{"index": c_idx, "delta": {"content": flushed}, "finish_reason": None}],
+                    })
+                elif chan == "reasoning_content":
+                    chunks_to_emit.append({
+                        "id": "chatcmpl-stream",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": candidate["model_name"],
+                        "choices": [{"index": c_idx, "delta": {"reasoning_content": flushed}, "finish_reason": None}],
+                    })
+
+        if tool_args_buffer:
+            by_choice: Dict[int, List[Tuple[int, str]]] = {}
+            for (c_idx, t_idx), raw_args in sorted(tool_args_buffer.items()):
+                by_choice.setdefault(c_idx, []).append((t_idx, raw_args))
+            tool_args_buffer.clear()
+
+            for c_idx, tools in by_choice.items():
+                tool_deltas = []
+                for t_idx, raw_args in tools:
+                    restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=True)
+                    tool_deltas.append({
+                        "index": t_idx,
+                        "function": {"arguments": restored_args},
+                    })
+                chunks_to_emit.append({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": candidate["model_name"],
+                    "choices": [{
+                        "index": c_idx,
+                        "delta": {"tool_calls": tool_deltas},
+                        "finish_reason": None,
+                    }],
+                })
+        return chunks_to_emit
+
     start_time = time.perf_counter()
+    first_event_deadline = start_time + config.server.first_event_timeout_seconds
+    max_duration_deadline = start_time + config.server.max_stream_duration_seconds
+
+    upstream = egress_guard.stream_post(target_url, headers=headers, json_data=payload)
+    upstream_iter = upstream.__aiter__()
 
     try:
-        async for chunk_bytes in egress_guard.stream_post(target_url, headers=headers, json_data=payload):
+        while True:
+            now = time.perf_counter()
+            if now >= max_duration_deadline:
+                logger.error(f"Stream max duration exceeded ({config.server.max_stream_duration_seconds}s)")
+                stream_failed = True
+                if not has_yielded:
+                    raise TimeoutError("Stream max duration exceeded before first event")
+                err_payload = make_openai_error("Stream max duration exceeded", "stream_timeout")
+                yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                return
+
+            if not has_received_valid_completion:
+                remaining_first = first_event_deadline - now
+                if remaining_first <= 0:
+                    raise TimeoutError(f"First event timeout exceeded ({config.server.first_event_timeout_seconds}s)")
+                chunk_timeout = min(remaining_first, max_duration_deadline - now)
+            else:
+                chunk_timeout = min(config.server.idle_timeout_seconds, max_duration_deadline - now)
+
+            try:
+                chunk_bytes = await asyncio.wait_for(upstream_iter.__anext__(), timeout=max(0.01, chunk_timeout))
+            except (asyncio.TimeoutError, TimeoutError):
+                if not has_received_valid_completion:
+                    raise TimeoutError("First event timeout waiting for valid completion chunk")
+                else:
+                    stream_failed = True
+                    logger.error("Stream idle timeout or max duration exceeded")
+                    err_payload = make_openai_error("Stream idle timeout exceeded", "stream_timeout")
+                    yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                    return
+            except StopAsyncIteration:
+                break
+
             chunk_str = decoder.decode(chunk_bytes, final=False)
             line_buffer += chunk_str
+
+            # Check line buffer ceiling (N01)
+            if len(line_buffer.encode("utf-8")) > config.server.max_sse_line_bytes:
+                logger.error("SSE line exceeded max_sse_line_bytes limit")
+                stream_failed = True
+                err_payload = make_openai_error("SSE line exceeded maximum allowed buffer size", "stream_error")
+                yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                return
 
             # Process lines split by newline
             while "\n" in line_buffer:
@@ -758,100 +1322,147 @@ async def _handle_streaming_proxy(
                 # Blank line indicates end of an SSE event
                 if not line:
                     if current_data_lines:
+                        # Check event size ceiling (N01)
+                        event_size = sum(len(l.encode("utf-8")) for l in current_data_lines)
+                        if event_size > config.server.max_sse_event_bytes:
+                            logger.error("SSE event exceeded max_sse_event_bytes limit")
+                            stream_failed = True
+                            err_payload = make_openai_error("SSE event exceeded maximum allowed buffer size", "stream_error")
+                            yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                            return
+
                         raw_data = "\n".join(current_data_lines)
                         current_data_lines = []
 
                         if raw_data.strip() == "[DONE]":
                             has_seen_done = True
-                            # Flush all remaining buffers across all channels
-                            for (c_idx, chan, t_idx), r in restorers.items():
-                                flushed = r.flush()
-                                if flushed:
-                                    if chan == "content":
-                                        flush_chunk = {
-                                            "id": "chatcmpl-stream",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": candidate["model_name"],
-                                            "choices": [{"index": c_idx, "delta": {"content": flushed}, "finish_reason": None}],
-                                        }
-                                        has_yielded = True
-                                        yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
-                                    elif chan == "tool_arguments":
-                                        flush_chunk = {
-                                            "id": "chatcmpl-stream",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": candidate["model_name"],
-                                            "choices": [{
-                                                "index": c_idx,
-                                                "delta": {
-                                                    "tool_calls": [{
-                                                        "index": t_idx,
-                                                        "function": {"arguments": flushed},
-                                                    }]
-                                                },
-                                                "finish_reason": None,
-                                            }],
-                                        }
-                                        has_yielded = True
-                                        yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
+                            for chk in flush_all_remaining():
+                                has_yielded = True
+                                yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
                             has_yielded = True
                             yield b"data: [DONE]\n\n"
-                        else:
-                            try:
-                                chunk_obj = json.loads(raw_data)
-                                if "usage" in chunk_obj and isinstance(chunk_obj["usage"], dict):
-                                    actual_tokens_reported = chunk_obj["usage"].get("total_tokens")
+                            break
 
-                                choices = chunk_obj.get("choices", [])
-                                for choice in choices:
-                                    c_idx = choice.get("index", 0)
-                                    delta = choice.get("delta", {})
-                                    content = delta.get("content")
-                                    finish_reason = choice.get("finish_reason")
+                        try:
+                            chunk_obj = json.loads(raw_data)
+                        except Exception:
+                            # Malformed JSON event in stream: terminate failed immediately without recording success (N02)
+                            logger.error("Malformed JSON received in stream event")
+                            stream_failed = True
+                            has_yielded = True
+                            err_payload = make_openai_error("Malformed JSON received in stream event", "stream_error")
+                            yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                            return
 
-                                    # Restore content channel
-                                    if isinstance(content, str):
-                                        tokens_estimated += 1
-                                        r_content = get_restorer(c_idx, "content", 0)
-                                        delta["content"] = r_content.feed(content)
+                        if not isinstance(chunk_obj, dict):
+                            stream_failed = True
+                            has_yielded = True
+                            err_payload = make_openai_error("Invalid SSE event structure", "stream_error")
+                            yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                            return
 
-                                    # Restore reasoning_content channel
-                                    reasoning = delta.get("reasoning_content")
-                                    if isinstance(reasoning, str):
-                                        r_reasoning = get_restorer(c_idx, "reasoning_content", 0)
-                                        delta["reasoning_content"] = r_reasoning.feed(reasoning)
+                        if "usage" in chunk_obj and isinstance(chunk_obj["usage"], dict):
+                            actual_tokens_reported = chunk_obj["usage"].get("total_tokens")
 
-                                    # Restore tool_calls arguments channel
-                                    if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
-                                        for t_idx, tc in enumerate(delta["tool_calls"]):
-                                            fn = tc.get("function", {})
-                                            args = fn.get("arguments")
-                                            if isinstance(args, str):
-                                                r_arg = get_restorer(c_idx, "tool_arguments", t_idx)
-                                                fn["arguments"] = r_arg.feed(args)
+                        choices = chunk_obj.get("choices", [])
+                        for choice in choices:
+                            c_idx = choice.get("index", 0)
+                            if c_idx in finished_choices:
+                                choice.get("delta", {}).clear()
+                                continue
 
-                                    # If finish_reason encountered, flush remaining buffer for this choice
-                                    if finish_reason:
-                                        r_content = restorers.get((c_idx, "content", 0))
-                                        if r_content:
-                                            flushed = r_content.flush()
-                                            if flushed:
-                                                delta["content"] = (delta.get("content") or "") + flushed
-                                        r_reasoning = restorers.get((c_idx, "reasoning_content", 0))
-                                        if r_reasoning:
-                                            flushed_reas = r_reasoning.flush()
-                                            if flushed_reas:
-                                                delta["reasoning_content"] = (delta.get("reasoning_content") or "") + flushed_reas
+                            delta = choice.get("delta", {})
+                            finish_reason = choice.get("finish_reason")
 
-                                has_yielded = True
-                                yield f"data: {json.dumps(chunk_obj)}\n\n".encode("utf-8")
-                            except json.JSONDecodeError:
-                                # Malformed JSON event in stream: emit controlled error event
-                                has_yielded = True
-                                err_payload = make_openai_error("Malformed JSON received in stream event", "stream_error")
-                                yield f"data: {json.dumps(err_payload)}\n\n".encode("utf-8")
+                            # Restore content channel
+                            content = delta.get("content")
+                            if isinstance(content, str):
+                                has_received_valid_completion = True
+                                tokens_estimated += 1
+                                r_content = get_restorer(c_idx, "content", 0)
+                                delta["content"] = r_content.feed(content)
+
+                            # Restore reasoning_content channel
+                            reasoning = delta.get("reasoning_content")
+                            if isinstance(reasoning, str):
+                                has_received_valid_completion = True
+                                r_reasoning = get_restorer(c_idx, "reasoning_content", 0)
+                                delta["reasoning_content"] = r_reasoning.feed(reasoning)
+
+                            # Buffer tool_calls arguments channel per (choice_idx, tool_idx) (N02)
+                            if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
+                                has_received_valid_completion = True
+                                for tc in delta["tool_calls"]:
+                                    t_idx = tc.get("index")
+                                    if type(t_idx) is not int or t_idx < 0:
+                                        raise ValueError("Invalid tool index")
+                                    fn = tc.get("function", {})
+                                    args = fn.get("arguments")
+                                    if isinstance(args, str):
+                                        key = (c_idx, t_idx)
+                                        tool_args_buffer[key] = tool_args_buffer.get(key, "") + args
+                                        # Tool buffer ceiling (N01)
+                                        total_tool_bytes = sum(len(v.encode("utf-8")) for v in tool_args_buffer.values())
+                                        if total_tool_bytes > config.server.max_tool_buffer_bytes:
+                                            stream_failed = True
+                                            err_payload = make_openai_error("Tool arguments buffer exceeded maximum allowed size", "stream_error")
+                                            yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                                            return
+                                        fn["arguments"] = ""
+
+                            # If finish_reason encountered, flush remaining buffer for this choice BEFORE finish_reason (N02)
+                            if finish_reason:
+                                r_content = restorers.get((c_idx, "content", 0))
+                                if r_content:
+                                    flushed = r_content.flush()
+                                    if flushed:
+                                        delta["content"] = (delta.get("content") or "") + flushed
+
+                                r_reasoning = restorers.get((c_idx, "reasoning_content", 0))
+                                if r_reasoning:
+                                    flushed_reas = r_reasoning.flush()
+                                    if flushed_reas:
+                                        delta["reasoning_content"] = (delta.get("reasoning_content") or "") + flushed_reas
+
+                                # Flush tool arguments for this choice
+                                tools_for_choice = [k for k in list(tool_args_buffer.keys()) if k[0] == c_idx]
+                                if tools_for_choice:
+                                    tool_deltas = []
+                                    for (_, t_idx) in sorted(tools_for_choice, key=lambda x: x[1]):
+                                        raw_args = tool_args_buffer.pop((c_idx, t_idx))
+                                        try:
+                                            restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=False)
+                                        except Exception as e:
+                                            stream_failed = True
+                                            logger.error(f"Invalid upstream tool arguments JSON: {e}")
+                                            err_payload = make_openai_error("Invalid upstream tool arguments JSON", "stream_error")
+                                            yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
+                                            return
+
+                                        tool_deltas.append({
+                                            "index": t_idx,
+                                            "function": {"arguments": restored_args},
+                                        })
+
+                                    # Emit flushed tool arguments chunk before finish_reason
+                                    flush_chunk = {
+                                        "id": chunk_obj.get("id", "chatcmpl-stream"),
+                                        "object": "chat.completion.chunk",
+                                        "created": chunk_obj.get("created", int(time.time())),
+                                        "model": chunk_obj.get("model", candidate["model_name"]),
+                                        "choices": [{
+                                            "index": c_idx,
+                                            "delta": {"tool_calls": tool_deltas},
+                                            "finish_reason": None,
+                                        }],
+                                    }
+                                    has_yielded = True
+                                    yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
+
+                                finished_choices.add(c_idx)
+
+                        has_yielded = True
+                        yield f"data: {json.dumps(chunk_obj)}\n\n".encode("utf-8")
                     continue
 
                 # Collect data lines
@@ -859,6 +1470,9 @@ async def _handle_streaming_proxy(
                     data_val = line[5:].lstrip()
                     current_data_lines.append(data_val)
                 # Ignore comments (: ping) or other SSE fields
+
+            if has_seen_done:
+                break
 
         # Final decode flush
         trailing = decoder.decode(b"", final=True)
@@ -872,27 +1486,39 @@ async def _handle_streaming_proxy(
             raw_data = "\n".join(current_data_lines)
             if raw_data.strip() == "[DONE]":
                 has_seen_done = True
+                for chk in flush_all_remaining():
+                    has_yielded = True
+                    yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
 
         # Check stream completeness contract (R2-06)
         if not has_seen_done:
             logger.error(f"Stream from provider {provider} terminated prematurely without [DONE]")
+            for chk in flush_all_remaining():
+                has_yielded = True
+                yield f"data: {json.dumps(chk)}\n\n".encode("utf-8")
             has_yielded = True
             err_incomplete = make_openai_error("Stream connection closed prematurely by upstream", "upstream_incomplete")
             yield f"data: {json.dumps(err_incomplete)}\n\ndata: [DONE]\n\n".encode("utf-8")
             return
 
-        # Record token usage for quota tracking
-        final_tokens = actual_tokens_reported if actual_tokens_reported is not None else max(1, tokens_estimated)
-        await storage_db.increment_provider_usage(config.db_path, provider, final_tokens)
-        await storage_db.update_model_metrics(config.db_path, candidate["id"], 150.0, True, tokens_used=final_tokens)
+        # Record token usage for quota tracking strictly upon clean completion (N02)
+        if has_seen_done and not stream_failed:
+            final_tokens = actual_tokens_reported if actual_tokens_reported is not None else max(1, tokens_estimated)
+            await storage_db.increment_provider_usage(config.db_path, provider, final_tokens)
+            await storage_db.update_model_metrics(
+                config.db_path, candidate["id"], (time.perf_counter() - start_time) * 1000.0,
+                True, tokens_used=final_tokens,
+            )
 
     except (GeneratorExit, asyncio.CancelledError):
-        # Clean client disconnection
-        pass
+        raise
     except Exception as e:
         if not has_yielded:
             raise
         logger.error(f"Stream error on candidate {candidate['id']}: {e.__class__.__name__}")
         err_msg = json.dumps(make_openai_error("Stream transmission error occurred", "stream_error"))
         yield f"data: {err_msg}\n\ndata: [DONE]\n\n".encode("utf-8")
+
+    finally:
+        await upstream.aclose()

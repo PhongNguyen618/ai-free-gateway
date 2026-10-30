@@ -26,9 +26,10 @@ class PinnedNetworkBackend(AnyIOBackend):
     preventing Time-of-Check to Time-of-Use DNS rebinding attacks.
     """
 
-    def __init__(self, pinned_map: Optional[Dict[str, str]] = None):
+    def __init__(self, pinned_map: Optional[Dict[str, str]] = None, fail_closed: bool = False):
         super().__init__()
         self.pinned_map: Dict[str, str] = pinned_map if pinned_map is not None else {}
+        self.fail_closed: bool = fail_closed
         self.last_connect_target: Optional[str] = None
 
     async def connect_tcp(
@@ -39,6 +40,9 @@ class PinnedNetworkBackend(AnyIOBackend):
         local_address: Optional[str] = None,
         socket_options: Optional[Any] = None,
     ) -> httpcore.AsyncNetworkStream:
+        if self.fail_closed and host not in self.pinned_map:
+            raise ConnectError(f"DNS pinning policy failure: domain '{host}' has no verified pinned IP address")
+
         target_ip = self.pinned_map.get(host, host)
         self.last_connect_target = target_ip
 
@@ -76,6 +80,7 @@ class EgressGuard:
         whitelist_domains: List[str],
         timeout_seconds: float = 60.0,
         max_request_bytes: int = 10485760,  # 10MB
+        max_response_bytes: int = 16777216,  # 16MB
         block_private_ips: bool = True,
         allow_http: bool = False,
         dns_resolver: Optional[Any] = None,
@@ -83,12 +88,13 @@ class EgressGuard:
         self.whitelist_domains = [d.lower().strip() for d in whitelist_domains]
         self.timeout = httpx.Timeout(timeout_seconds)
         self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
         self.block_private_ips = block_private_ips
         self.allow_http = allow_http
         self._dns_resolver = dns_resolver
 
         self._pinned_hosts: Dict[str, str] = {}
-        self._network_backend = PinnedNetworkBackend(self._pinned_hosts)
+        self._network_backend = PinnedNetworkBackend(self._pinned_hosts, fail_closed=True)
 
         # Internal connection pool with pinned network backend
         pool = httpcore.AsyncConnectionPool(
@@ -259,13 +265,40 @@ class EgressGuard:
         self.total_requests += 1
 
         start_time = time.perf_counter()
-        response = await self._client.post(
+        req = self._client.build_request(
+            "POST",
             url,
             headers=req_headers,
             content=payload_bytes if (json_data is not None or content is not None) else None,
         )
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        response = await self._client.send(req, stream=True)
+        try:
+            cl = response.headers.get("content-length")
+            if cl:
+                try:
+                    if int(cl) > self.max_response_bytes:
+                        raise EgressBlockedError(
+                            f"Response size {cl} bytes exceeds maximum allowed limit {self.max_response_bytes} bytes"
+                        )
+                except ValueError:
+                    pass
 
+            body_chunks = []
+            total_inbound = 0
+            async for chunk in response.aiter_bytes():
+                total_inbound += len(chunk)
+                if total_inbound > self.max_response_bytes:
+                    raise EgressBlockedError(
+                        f"Response size exceeded maximum allowed limit {self.max_response_bytes} bytes"
+                    )
+                body_chunks.append(chunk)
+
+            full_content = b"".join(body_chunks)
+            response._content = full_content
+        finally:
+            await response.aclose()
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
         self.total_inbound_bytes += len(response.content)
         response.latency_ms = latency_ms  # type: ignore[attr-defined]
         return response
@@ -282,13 +315,40 @@ class EgressGuard:
         self.total_requests += 1
 
         start_time = time.perf_counter()
-        response = await self._client.get(
+        req = self._client.build_request(
+            "GET",
             url,
             headers=headers,
             params=params,
         )
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        response = await self._client.send(req, stream=True)
+        try:
+            cl = response.headers.get("content-length")
+            if cl:
+                try:
+                    if int(cl) > self.max_response_bytes:
+                        raise EgressBlockedError(
+                            f"Response size {cl} bytes exceeds maximum allowed limit {self.max_response_bytes} bytes"
+                        )
+                except ValueError:
+                    pass
 
+            body_chunks = []
+            total_inbound = 0
+            async for chunk in response.aiter_bytes():
+                total_inbound += len(chunk)
+                if total_inbound > self.max_response_bytes:
+                    raise EgressBlockedError(
+                        f"Response size exceeded maximum allowed limit {self.max_response_bytes} bytes"
+                    )
+                body_chunks.append(chunk)
+
+            full_content = b"".join(body_chunks)
+            response._content = full_content
+        finally:
+            await response.aclose()
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
         self.total_inbound_bytes += len(response.content)
         response.latency_ms = latency_ms  # type: ignore[attr-defined]
         return response

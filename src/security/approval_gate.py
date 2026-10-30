@@ -133,9 +133,9 @@ class ApprovalGate:
             return decision, item
 
         except asyncio.TimeoutError:
-            # Race condition handling: check if admin conditionally updated DB first
-            updated = await storage_db.update_pending_approval_status(
-                self.db_path, approval_id, "expired", require_unexpired=True
+            # Race condition handling: atomically expire only if deadline passed (N03)
+            updated = await storage_db.expire_pending_approval(
+                self.db_path, approval_id
             )
             if not updated:
                 db_row = await storage_db.get_approval_by_id(self.db_path, approval_id)
@@ -154,11 +154,12 @@ class ApprovalGate:
                 self._gates.pop(approval_id, None)
 
     async def cancel_request(self, approval_id: str) -> None:
-        """Handle client disconnection / cancellation cleanly in memory and SQLite."""
+        """Handle client disconnection / cancellation cleanly in memory and SQLite (N03)."""
         async with self._lock:
             item = self._gates.pop(approval_id, None)
             if item:
-                item.decision = "cancelled"
+                if item.decision not in ("approved", "rejected"):
+                    item.decision = "cancelled"
                 item.event.set()
 
         await storage_db.update_pending_approval_status(

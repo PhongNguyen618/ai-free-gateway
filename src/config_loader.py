@@ -22,8 +22,20 @@ class ServerConfig(BaseModel):
     debug: bool = Field(default=False)
     gateway_api_key: str = Field(default="")
     cors_allowed_origins: List[str] = Field(default_factory=list)
+    allowed_hosts: List[str] = Field(default_factory=list)
     allow_insecure_external: bool = Field(default=False)
     record_pid: bool = Field(default=True)
+    max_body_bytes: int = Field(default=2097152, gt=0)  # 2 MiB
+    max_concurrent_completions: int = Field(default=8, gt=0)
+    max_pending_approvals: int = Field(default=32, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+    first_event_timeout_seconds: float = Field(default=30.0, gt=0)
+    idle_timeout_seconds: float = Field(default=60.0, gt=0)
+    max_stream_duration_seconds: float = Field(default=600.0, gt=0)
+    total_completion_timeout_seconds: float = Field(default=120.0, gt=0)
+    max_sse_line_bytes: int = Field(default=262144, gt=0)  # 256 KiB
+    max_sse_event_bytes: int = Field(default=1048576, gt=0)  # 1 MiB
+    max_tool_buffer_bytes: int = Field(default=1048576, gt=0)  # 1 MiB
 
 
 class EgressConfig(BaseModel):
@@ -38,6 +50,7 @@ class EgressConfig(BaseModel):
     )
     timeout_seconds: float = Field(default=60.0, gt=0)
     max_request_bytes: int = Field(default=10485760, gt=0)  # 10MB
+    max_response_bytes: int = Field(default=16777216, gt=0)  # 16 MiB
     block_private_ips: bool = Field(default=True)
     allow_http: bool = Field(default=False)
 

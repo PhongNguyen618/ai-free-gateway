@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from src.config_loader import AppConfig, PROJECT_ROOT, get_config
 from src.discovery.harvester import ModelHarvester
+from src.lifecycle import InstanceLock, InstanceAlreadyRunningError
 from src.router.balancer import ModelBalancer
 from src.router.openai_proxy import create_openai_router, make_openai_error
 from src.security.approval_gate import ApprovalGate
@@ -49,6 +50,7 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         whitelist_domains=config.egress.whitelist_domains,
         timeout_seconds=config.egress.timeout_seconds,
         max_request_bytes=config.egress.max_request_bytes,
+        max_response_bytes=config.egress.max_response_bytes,
         block_private_ips=config.egress.block_private_ips,
         allow_http=config.egress.allow_http,
     )
@@ -58,46 +60,49 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logger.info("Initializing Local Zero-Trust Database...")
-        await storage_db.init_db(config.db_path)
+        # N05: Acquire OS-backed instance lock before cleanup or startup
+        instance_lock: Optional[InstanceLock] = None
+        should_lock = config.server.record_pid and (os.environ.get("GATEWAY_TEST_MODE", "").lower() not in ("1", "true"))
+        if should_lock:
+            instance_lock = InstanceLock(db_path=config.db_path, project_root=PROJECT_ROOT)
+            instance_lock.acquire()
 
-        # F11: Write current process PID to project root for safe stop verification
-        pid_file = PROJECT_ROOT / ".gateway.pid"
-        should_record_pid = config.server.record_pid and (os.environ.get("GATEWAY_TEST_MODE", "").lower() not in ("1", "true"))
-        if should_record_pid:
-            try:
-                pid_file.write_text(str(os.getpid()), encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Could not record .gateway.pid: {e}")
-
-        # F09: Clean up any orphan pending approvals from prior crashes/restarts
-        cleaned = await storage_db.cleanup_orphan_pending(config.db_path)
-        if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} orphan pending approvals from previous session.")
-
-        logger.info("Performing initial model harvesting and provider registration...")
         try:
-            await harvester.harvest_all()
-        except Exception as e:
-            logger.error(f"Initial harvest encountered an issue (will retry in background): {e}")
+            logger.info("Initializing Local Zero-Trust Database...")
+            await storage_db.init_db(config.db_path)
 
-        logger.info("Starting background model discovery task...")
-        harvester.start_background()
+            # F09: Clean up any orphan pending approvals from prior crashes/restarts
+            cleaned = await storage_db.cleanup_orphan_pending(config.db_path)
+            if cleaned > 0:
+                logger.info(f"Cleaned up {cleaned} orphan pending approvals from previous session.")
 
-        yield
-
-        logger.info("Shutting down background tasks & connections...")
-        await harvester.stop()
-        await egress_guard.close()
-
-        # Clean up PID file on graceful shutdown
-        if should_record_pid:
+            logger.info("Performing initial model harvesting and provider registration...")
             try:
-                if pid_file.exists() and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
-                    pid_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-        logger.info("Shutdown complete.")
+                await harvester.harvest_all()
+            except Exception as e:
+                logger.error(f"Initial harvest encountered an issue (will retry in background): {e}")
+
+            logger.info("Starting background model discovery task...")
+            harvester.start_background()
+
+            active_models = await storage_db.get_active_models(config.db_path)
+            app.state.initialized = True
+            app.state.catalog_usable = len(active_models) > 0
+
+            yield
+
+        finally:
+            logger.info("Shutting down background tasks & connections...")
+            app.state.initialized = False
+            app.state.catalog_usable = False
+            await harvester.stop()
+            await egress_guard.close()
+
+            # Clean up instance lock and metadata on graceful shutdown (N05)
+            if instance_lock:
+                instance_lock.release()
+
+            logger.info("Shutdown complete.")
 
     app = FastAPI(
         title="AI Free Gateway",
@@ -112,6 +117,8 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     app.state.approval_gate = approval_gate
     app.state.balancer = balancer
     app.state.harvester = harvester
+    app.state.initialized = False
+    app.state.catalog_usable = False
 
     # F01: Strict CORS configuration (defaults to same-origin)
     allowed_origins = list(config.server.cors_allowed_origins)
@@ -124,32 +131,94 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             allow_headers=["*"],
         )
 
-    # F01 & CSRF Protection Middleware
+    # Host header allowlist (N04)
+    trusted_hosts = {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "[::1]",
+        "testserver",
+        "test",
+        f"127.0.0.1:{config.server.port}",
+        f"localhost:{config.server.port}",
+        f"[::1]:{config.server.port}",
+    }
+    configured_host = config.server.host.lower().strip()
+    trusted_hosts.add(configured_host)
+    trusted_hosts.add(f"{configured_host}:{config.server.port}")
+    for h in config.server.allowed_hosts:
+        trusted_hosts.add(h.lower().strip())
+
+    # F01 & CSRF Protection Middleware (N04, N08)
     @app.middleware("http")
     async def origin_and_csrf_protection_middleware(request: Request, call_next):
+        # 0. Correlation ID injection (N08)
+        correlation_id = request.headers.get("X-Correlation-ID") or secrets.token_hex(8)
+        request.state.correlation_id = correlation_id
+
+        # 1. Host header validation (N04)
+        host_header = request.headers.get("host")
+        if host_header:
+            clean_host = host_header.lower().strip()
+            if clean_host not in trusted_hosts:
+                res = JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Invalid or untrusted Host header: {host_header}"},
+                )
+                res.headers["X-Correlation-ID"] = correlation_id
+                return res
+
+        # 2. Origin & CSRF validation for state-changing methods (N04)
         origin = request.headers.get("origin")
         if origin and request.method in ("POST", "PUT", "DELETE", "PATCH"):
-            # Check if origin is allowed or matches host
-            parsed_origin = urlparse(origin)
-            origin_host = parsed_origin.hostname or ""
-            origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+            if origin.strip().lower() == "null":
+                res = JSONResponse(
+                    status_code=403,
+                    content={"detail": "Null origin is not permitted for state-modifying operations."},
+                )
+                res.headers["X-Correlation-ID"] = correlation_id
+                return res
 
-            # Local same-host check
-            req_host = request.url.hostname or "127.0.0.1"
-            req_port = request.url.port or 80
+            try:
+                parsed_origin = urlparse(origin)
+                origin_scheme = (parsed_origin.scheme or "").lower()
+                origin_host = (parsed_origin.hostname or "").lower()
+                origin_port = parsed_origin.port or (443 if origin_scheme == "https" else 80)
+                if not origin_scheme or not origin_host:
+                    raise ValueError("Missing scheme or host in Origin")
+            except Exception:
+                res = JSONResponse(
+                    status_code=400,
+                    content={"detail": "Malformed Origin header."},
+                )
+                res.headers["X-Correlation-ID"] = correlation_id
+                return res
 
-            is_same_host = (origin_host == req_host) and (origin_port == req_port)
+            # Strict same-origin check including scheme, host, and port (N04)
+            req_scheme = (request.url.scheme or "http").lower()
+            req_host = (request.url.hostname or "127.0.0.1").lower()
+            req_port = request.url.port or (443 if req_scheme == "https" else 80)
+
+            is_same_origin = (
+                origin_scheme == req_scheme
+                and origin_host == req_host
+                and origin_port == req_port
+            )
             is_whitelisted = origin in allowed_origins
 
-            if not is_same_host and not is_whitelisted:
-                return JSONResponse(
+            if not is_same_origin and not is_whitelisted:
+                res = JSONResponse(
                     status_code=403,
                     content={"detail": "Cross-site state modification blocked by Zero-Trust Origin policy."},
                 )
+                res.headers["X-Correlation-ID"] = correlation_id
+                return res
 
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = correlation_id
+        return response
 
-    # F01: Shared Authentication Dependency
+    # F01: Shared Authentication Dependency (N04 Safe Unicode/ASCII Handling)
     async def verify_auth(
         authorization: Optional[str] = Header(None),
         x_gateway_key: Optional[str] = Header(None, alias="X-Gateway-Key"),
@@ -165,10 +234,21 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         elif x_gateway_key:
             provided = x_gateway_key.strip()
 
-        if not provided or not secrets.compare_digest(provided, master_key):
+        try:
+            if not provided or not secrets.compare_digest(
+                provided.encode("utf-8", errors="replace"),
+                master_key.encode("utf-8", errors="replace"),
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized: Missing or invalid Gateway API key.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Missing or invalid Gateway API key.",
+                detail="Unauthorized: Invalid authorization format.",
             )
 
     # --- UI & Dashboard Routes ---
@@ -189,6 +269,26 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     async def health_check() -> Dict[str, str]:
         """Minimal health check without leaking internal metadata."""
         return {"status": "ok"}
+
+    @app.get("/ready", tags=["System"])
+    async def readiness_check() -> Response:
+        """Readiness check reporting startup completion and catalog status without network calls (N08)."""
+        is_init = getattr(app.state, "initialized", False)
+        is_usable = getattr(app.state, "catalog_usable", False)
+
+        status_str = "ready" if (is_init and is_usable) else "not_ready"
+        status_code = 200 if (is_init and is_usable) else 503
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "status": status_str,
+                "initialized": is_init,
+                "catalog_usable": is_usable,
+                "is_harvesting": harvester.is_harvesting,
+                "is_stale": harvester.is_stale,
+            },
+        )
 
     @app.get("/api/stats", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
     async def get_stats() -> Dict[str, Any]:
