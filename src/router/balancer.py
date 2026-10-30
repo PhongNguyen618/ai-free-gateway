@@ -79,13 +79,14 @@ def estimate_payload_tokens(payload: Dict[str, Any]) -> int:
     return input_tokens + max(256, output_reserve)
 
 
-def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 15000) -> List[Dict[str, Any]]:
+def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 28000) -> List[Dict[str, Any]]:
     """
-    Ensure total message characters fit comfortably within Groq Free Tier's 8,000 TPM ceiling.
+    Ensure total message characters fit comfortably within Groq Free Tier TPM ceiling.
     Preserves:
-    1. messages[0] if system prompt.
+    1. messages[0] if system prompt, keeping both head and tail instructions if truncated.
     2. Latest messages at the end of the array (user prompt and immediate tool context).
     3. Tool calls and tool responses paired correctly.
+    Does NOT inject duplicate 'system' messages in the middle of conversations.
     """
     if not messages:
         return messages
@@ -107,10 +108,12 @@ def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 150
     working_msgs = messages[1:] if has_system else list(messages)
 
     sys_len = msg_len(system_msg) if system_msg else 0
-    if sys_len > (max_chars * 0.5) and system_msg and isinstance(system_msg.get("content"), str):
+    if sys_len > (max_chars * 0.85) and system_msg and isinstance(system_msg.get("content"), str):
         c_text = system_msg["content"]
         system_msg = dict(system_msg)
-        system_msg["content"] = c_text[:int(max_chars * 0.4)] + "\n...[System prompt compressed to fit Groq limit]..."
+        head_len = int(max_chars * 0.45)
+        tail_len = int(max_chars * 0.35)
+        system_msg["content"] = c_text[:head_len] + "\n...[System prompt middle compressed for context window]...\n" + c_text[-tail_len:]
         sys_len = msg_len(system_msg)
 
     remaining_budget = max_chars - sys_len
@@ -161,14 +164,90 @@ def prune_messages_for_groq(messages: List[Dict[str, Any]], max_chars: int = 150
 
     result = []
     if system_msg:
-        result.append(system_msg)
-    if len(kept_forward) < len(working_msgs):
-        result.append({
-            "role": "system",
-            "content": "[Previous conversation history compressed to fit Groq free tier limit]"
-        })
+        res_sys = dict(system_msg)
+        if len(kept_forward) < len(working_msgs) and isinstance(res_sys.get("content"), str):
+            res_sys["content"] += "\n[Note: Earlier conversation history was pruned to fit context limit]"
+        result.append(res_sys)
     result.extend(kept_forward)
     return result
+
+
+def normalize_messages_for_provider(messages: List[Dict[str, Any]], provider: str) -> List[Dict[str, Any]]:
+    """
+    Ensure compatibility across providers (Groq, Gemini, GitHub, OpenRouter):
+    1. Converts multimodal content parts [type: 'text'] to a single concatenated string
+       to prevent 400 Bad Request on providers expecting pure string content.
+    2. Ensures role='tool' content is always a string.
+    3. Cleans up non-standard reasoning_content fields.
+    """
+    cleaned = []
+    for m in messages:
+        if not isinstance(m, dict):
+            cleaned.append(m)
+            continue
+        m_copy = dict(m)
+        content = m_copy.get("content")
+
+        # 1. Normalize list content (ContentPart dicts) to a single string
+        if isinstance(content, list):
+            text_pieces = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
+                    text_pieces.append(p["text"])
+                elif isinstance(p, str):
+                    text_pieces.append(p)
+            m_copy["content"] = "\n".join(text_pieces)
+
+        # 2. For role == 'tool', content must always be a string
+        if m_copy.get("role") == "tool":
+            if m_copy.get("content") is None:
+                m_copy["content"] = ""
+            elif not isinstance(m_copy["content"], str):
+                m_copy["content"] = str(m_copy["content"])
+
+        # 3. For role == 'assistant', handle reasoning_content
+        if provider in ("groq", "gemini", "github"):
+            if not m_copy.get("content") and m_copy.get("reasoning_content") and not m_copy.get("tool_calls"):
+                m_copy["content"] = m_copy.get("reasoning_content")
+            m_copy.pop("reasoning_content", None)
+
+        cleaned.append(m_copy)
+    return cleaned
+
+
+def detect_agent_loop(messages: List[Dict[str, Any]]) -> Tuple[bool, Optional[str]]:
+    """
+    Detects if the AI Agent is stuck in an infinite repetition loop by inspecting
+    the recent assistant messages for identical tool calls or identical text output.
+    Returns (is_loop, loop_signature).
+    """
+    if not messages or len(messages) < 3:
+        return False, None
+
+    assistant_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"]
+    if len(assistant_msgs) < 2:
+        return False, None
+
+    last_a1 = assistant_msgs[-1]
+    last_a2 = assistant_msgs[-2]
+
+    # Pattern A: Repeated tool calls with identical function name & arguments
+    tc1 = last_a1.get("tool_calls")
+    tc2 = last_a2.get("tool_calls")
+    if isinstance(tc1, list) and isinstance(tc2, list) and len(tc1) > 0 and len(tc1) == len(tc2):
+        sig1 = [(t.get("function", {}).get("name"), (t.get("function", {}).get("arguments") or "").strip()) for t in tc1 if isinstance(t, dict)]
+        sig2 = [(t.get("function", {}).get("name"), (t.get("function", {}).get("arguments") or "").strip()) for t in tc2 if isinstance(t, dict)]
+        if sig1 and sig1 == sig2:
+            return True, f"repeated_tool:{sig1[0][0]}"
+
+    # Pattern B: Repeated exact content
+    c1 = last_a1.get("content")
+    c2 = last_a2.get("content")
+    if isinstance(c1, str) and isinstance(c2, str) and len(c1.strip()) >= 30:
+        if c1.strip() == c2.strip():
+            return True, "repeated_content"
+
+    return False, None
 
 
 class ModelBalancer:
@@ -541,7 +620,21 @@ class ModelBalancer:
             score += max(0.0, 300.0 / (latency + 1.0))
 
             errors = int(m.get("error_count", 0))
-            score -= (errors * 20.0)
+            successes = int(m.get("success_count", 0) or 0)
+            if errors >= 3 and successes == 0:
+                score -= 1500.0
+            else:
+                score -= (errors * 35.0)
+
+            if successes > 0:
+                score += min(200.0, successes * 10.0)
+
+            if has_tools:
+                m_lower = m["model_name"].lower()
+                if any(x in m_lower for x in ["r1-distill", "gemma", "phi-3", "nemotron", "vision", "vl"]):
+                    score -= 300.0
+                elif any(x in m_lower for x in ["gpt-4", "gpt-oss", "qwen", "llama-3.3", "llama-3.1", "claude"]):
+                    score += 150.0
 
             scored_candidates.append((score, m))
 
@@ -595,34 +688,41 @@ class ModelBalancer:
         if effort not in ("low", "medium", "high"):
             req_payload.pop("reasoning_effort", None)
 
-        # Sanitize messages for providers that reject non-standard fields (e.g. Groq, Gemini, GitHub)
-        if provider in ("groq", "gemini", "github"):
-            cleaned_messages = []
-            for m in req_payload.get("messages", []):
-                if isinstance(m, dict):
-                    m_copy = dict(m)
-                    if not m_copy.get("content") and m_copy.get("reasoning_content"):
-                        m_copy["content"] = m_copy.get("reasoning_content")
-                    m_copy.pop("reasoning_content", None)
-                    cleaned_messages.append(m_copy)
-                else:
-                    cleaned_messages.append(m)
-            # For Groq: Auto-prune message history and cap max_tokens to fit Groq Free Tier's 8,000 TPM ceiling
-            if provider == "groq":
-                tools_len = sum(len(json.dumps(t.get("function", {}))) for t in req_payload.get("tools", []) if isinstance(t, dict))
-                avail_chars = max(6000, 15000 - tools_len)
-                cleaned_messages = prune_messages_for_groq(cleaned_messages, max_chars=avail_chars)
-                if "max_tokens" in req_payload and req_payload["max_tokens"] is not None:
-                    try:
-                        req_payload["max_tokens"] = min(2048, int(req_payload["max_tokens"]))
-                    except (ValueError, TypeError):
-                        pass
-                if "max_completion_tokens" in req_payload and req_payload["max_completion_tokens"] is not None:
-                    try:
-                        req_payload["max_completion_tokens"] = min(2048, int(req_payload["max_completion_tokens"]))
-                    except (ValueError, TypeError):
-                        pass
+        # Normalize messages across all providers (U02)
+        raw_msgs = req_payload.get("messages", [])
+        cleaned_messages = normalize_messages_for_provider(raw_msgs, provider)
 
-            req_payload["messages"] = cleaned_messages
+        # Agent Loop Detection & Recovery Notice injection (U04)
+        is_loop, _ = detect_agent_loop(cleaned_messages)
+        if is_loop and cleaned_messages:
+            last_m = dict(cleaned_messages[-1])
+            curr_c = last_m.get("content")
+            if isinstance(curr_c, str):
+                last_m["content"] = curr_c + (
+                    "\n\n[SYSTEM NOTICE: Repetition loop detected. You have executed the exact same action/output "
+                    "multiple times. Do NOT call the same tool with identical arguments again. "
+                    "Analyze the situation carefully, change your approach, or provide your final response to the user.]"
+                )
+                cleaned_messages = cleaned_messages[:-1] + [last_m]
 
+            current_temp = req_payload.get("temperature")
+            if current_temp is None or current_temp < 0.4:
+                req_payload["temperature"] = 0.5
+
+        if provider == "groq":
+            tools_len = sum(len(json.dumps(t.get("function", {}))) for t in req_payload.get("tools", []) if isinstance(t, dict))
+            avail_chars = max(6000, 15000 - tools_len)
+            cleaned_messages = prune_messages_for_groq(cleaned_messages, max_chars=avail_chars)
+            if "max_tokens" in req_payload and req_payload["max_tokens"] is not None:
+                try:
+                    req_payload["max_tokens"] = min(2048, int(req_payload["max_tokens"]))
+                except (ValueError, TypeError):
+                    pass
+            if "max_completion_tokens" in req_payload and req_payload["max_completion_tokens"] is not None:
+                try:
+                    req_payload["max_completion_tokens"] = min(2048, int(req_payload["max_completion_tokens"]))
+                except (ValueError, TypeError):
+                    pass
+
+        req_payload["messages"] = cleaned_messages
         return target_url, headers, req_payload

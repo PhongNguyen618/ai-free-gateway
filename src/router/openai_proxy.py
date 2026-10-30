@@ -129,8 +129,10 @@ def restore_tool_arguments_json(
     If allow_raw_string is True and raw_args is not valid JSON (e.g. fragments or mock strings),
     falls back to text restoration.
     """
-    if not raw_args:
-        return raw_args
+    if raw_args is None:
+        return "{}"
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return "{}"
     try:
         parsed = json.loads(raw_args)
         if reverse_map:
@@ -922,6 +924,9 @@ def create_openai_router(
                                 continue
                             elif e.response.status_code in (401, 403):
                                 failed_auth_providers.add(provider)
+                                await storage_db.set_provider_cooldown(
+                                    config.db_path, provider, 300, e.response.status_code, "Authentication or permission failed"
+                                )
                                 last_error = f"Stream provider {provider} authentication failed (HTTP {e.response.status_code})"
                                 failed_attempts.append({"id": candidate["id"], "provider": provider, "status_code": e.response.status_code, "error": last_error})
                                 continue
@@ -1024,6 +1029,9 @@ def create_openai_router(
 
                     if resp.status_code in (401, 403):
                         failed_auth_providers.add(provider)
+                        await storage_db.set_provider_cooldown(
+                            config.db_path, provider, 300, resp.status_code, "Authentication or permission failed"
+                        )
                         await storage_db.update_model_metrics(
                             config.db_path, candidate["id"], getattr(resp, "latency_ms", 500.0), False
                         )
@@ -1214,8 +1222,8 @@ async def _handle_streaming_proxy(
     stream_failed = False
     finished_choices: Set[int] = set()
 
-    # Per (choice_idx, tool_idx) arguments buffer
-    tool_args_buffer: Dict[Tuple[int, int], str] = {}
+    # Per (choice_idx, tool_idx) tool calls state buffer (preserving id, name, type, and arguments)
+    tool_calls_state: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
     def flush_all_remaining() -> List[Dict[str, Any]]:
         chunks_to_emit: List[Dict[str, Any]] = []
@@ -1239,20 +1247,29 @@ async def _handle_streaming_proxy(
                         "choices": [{"index": c_idx, "delta": {"reasoning_content": flushed}, "finish_reason": None}],
                     })
 
-        if tool_args_buffer:
-            by_choice: Dict[int, List[Tuple[int, str]]] = {}
-            for (c_idx, t_idx), raw_args in sorted(tool_args_buffer.items()):
-                by_choice.setdefault(c_idx, []).append((t_idx, raw_args))
-            tool_args_buffer.clear()
+        if tool_calls_state:
+            by_choice: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+            for (c_idx, t_idx), state in sorted(tool_calls_state.items()):
+                by_choice.setdefault(c_idx, []).append((t_idx, state))
+            tool_calls_state.clear()
 
             for c_idx, tools in by_choice.items():
                 tool_deltas = []
-                for t_idx, raw_args in tools:
+                for t_idx, state in tools:
+                    raw_args = state.get("arguments", "")
+                    if not raw_args and state.get("name"):
+                        raw_args = "{}"
                     restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=False)
-                    tool_deltas.append({
+                    tc_entry: Dict[str, Any] = {
                         "index": t_idx,
+                        "type": state.get("type") or "function",
                         "function": {"arguments": restored_args},
-                    })
+                    }
+                    if state.get("id"):
+                        tc_entry["id"] = state["id"]
+                    if state.get("name"):
+                        tc_entry["function"]["name"] = state["name"]
+                    tool_deltas.append(tc_entry)
                 chunks_to_emit.append({
                     "id": "chatcmpl-stream",
                     "object": "chat.completion.chunk",
@@ -1421,20 +1438,32 @@ async def _handle_streaming_proxy(
                                 r_reasoning = get_restorer(c_idx, "reasoning_content", 0)
                                 delta["reasoning_content"] = r_reasoning.feed(reasoning)
 
-                            # Buffer tool_calls arguments channel per (choice_idx, tool_idx) (N02)
+                            # Buffer tool_calls arguments channel per (choice_idx, tool_idx) (N02, U01)
                             if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
                                 has_received_valid_completion = True
                                 for tc in delta["tool_calls"]:
                                     t_idx = tc.get("index")
                                     if type(t_idx) is not int or t_idx < 0:
-                                        raise ValueError("Invalid tool index")
+                                        t_idx = 0
+                                    key = (c_idx, t_idx)
+                                    state = tool_calls_state.setdefault(key, {
+                                        "id": None,
+                                        "type": "function",
+                                        "name": None,
+                                        "arguments": "",
+                                    })
+                                    if tc.get("id"):
+                                        state["id"] = tc["id"]
+                                    if tc.get("type"):
+                                        state["type"] = tc["type"]
                                     fn = tc.get("function", {})
+                                    if fn.get("name"):
+                                        state["name"] = fn["name"]
                                     args = fn.get("arguments")
                                     if isinstance(args, str):
-                                        key = (c_idx, t_idx)
-                                        tool_args_buffer[key] = tool_args_buffer.get(key, "") + args
+                                        state["arguments"] += args
                                         # Tool buffer ceiling (N01)
-                                        total_tool_bytes = sum(len(v.encode("utf-8")) for v in tool_args_buffer.values())
+                                        total_tool_bytes = sum(len(v.get("arguments", "").encode("utf-8")) for v in tool_calls_state.values())
                                         if total_tool_bytes > config.server.max_tool_buffer_bytes:
                                             stream_failed = True
                                             err_payload = make_openai_error("Tool arguments buffer exceeded maximum allowed size", "stream_error")
@@ -1442,7 +1471,7 @@ async def _handle_streaming_proxy(
                                             return
                                         fn["arguments"] = ""
 
-                            # If finish_reason encountered, flush remaining buffer for this choice BEFORE finish_reason (N02)
+                            # If finish_reason encountered, flush remaining buffer for this choice BEFORE finish_reason (N02, U01)
                             if finish_reason:
                                 r_content = restorers.get((c_idx, "content", 0))
                                 if r_content:
@@ -1457,11 +1486,14 @@ async def _handle_streaming_proxy(
                                         delta["reasoning_content"] = (delta.get("reasoning_content") or "") + flushed_reas
 
                                 # Flush tool arguments for this choice
-                                tools_for_choice = [k for k in list(tool_args_buffer.keys()) if k[0] == c_idx]
+                                tools_for_choice = [k for k in list(tool_calls_state.keys()) if k[0] == c_idx]
                                 if tools_for_choice:
                                     tool_deltas = []
                                     for (_, t_idx) in sorted(tools_for_choice, key=lambda x: x[1]):
-                                        raw_args = tool_args_buffer.pop((c_idx, t_idx))
+                                        state = tool_calls_state.pop((c_idx, t_idx))
+                                        raw_args = state.get("arguments", "")
+                                        if not raw_args and state.get("name"):
+                                            raw_args = "{}"
                                         try:
                                             restored_args = restore_tool_arguments_json(raw_args, reverse_map, allow_raw_string=False)
                                         except Exception as e:
@@ -1472,10 +1504,16 @@ async def _handle_streaming_proxy(
                                             yield f"data: {json.dumps(err_payload)}\n\ndata: [DONE]\n\n".encode("utf-8")
                                             return
 
-                                        tool_deltas.append({
+                                        tc_entry: Dict[str, Any] = {
                                             "index": t_idx,
+                                            "type": state.get("type") or "function",
                                             "function": {"arguments": restored_args},
-                                        })
+                                        }
+                                        if state.get("id"):
+                                            tc_entry["id"] = state["id"]
+                                        if state.get("name"):
+                                            tc_entry["function"]["name"] = state["name"]
+                                        tool_deltas.append(tc_entry)
 
                                     # Emit flushed tool arguments chunk before finish_reason
                                     flush_chunk = {
@@ -1493,6 +1531,7 @@ async def _handle_streaming_proxy(
                                     yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
 
                                 finished_choices.add(c_idx)
+                                delta.pop("tool_calls", None)
 
                         has_yielded = True
                         yield f"data: {json.dumps(chunk_obj)}\n\n".encode("utf-8")

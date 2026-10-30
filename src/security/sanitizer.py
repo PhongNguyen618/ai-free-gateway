@@ -304,6 +304,11 @@ class DLPSanitizer:
                     continue
                 if candidate.count("_") >= 2:
                     continue
+                # Skip common file paths or URLs from false entropy triggers
+                if any(candidate.lower().endswith(ext) for ext in (".py", ".json", ".yaml", ".yml", ".html", ".css", ".js", ".ts", ".md", ".txt", ".bat", ".sh", ".lock")):
+                    continue
+                if candidate.startswith(("/", "./", "../", "http://", "https://")):
+                    continue
                 if any(s["start"] <= start and s["end"] >= end for s in raw_spans):
                     continue
 
