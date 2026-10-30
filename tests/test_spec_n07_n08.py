@@ -160,3 +160,23 @@ async def test_n08_correlation_id_propagated_in_response_headers_and_errors(n07_
         )
         assert resp3.status_code == 400
         assert resp3.headers.get("X-Correlation-ID") == "err-trace-789"
+
+
+@pytest.mark.asyncio
+async def test_api_providers_ping_endpoint(n07_n08_env):
+    """Verify that /api/providers/ping returns provider readiness without leaking raw keys."""
+    app, config, test_db = n07_n08_env
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/providers/ping")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "providers" in data
+        assert isinstance(data["providers"], list)
+        for p in data["providers"]:
+            assert "provider" in p
+            assert "status" in p
+            assert "message" in p
+            # Ensure no API key secret is leaked in message
+            assert "sk-" not in p["message"]
+            assert "gsk_" not in p["message"]

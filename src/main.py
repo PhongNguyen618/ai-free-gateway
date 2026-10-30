@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from src.config_loader import AppConfig, PROJECT_ROOT, get_config
+from src.config_loader import AppConfig, PROJECT_ROOT, get_config, get_provider_api_key
 from src.discovery.harvester import ModelHarvester
 from src.lifecycle import InstanceLock, InstanceAlreadyRunningError
 from src.router.balancer import ModelBalancer
@@ -357,6 +357,48 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     @app.post("/api/harvester/trigger", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
     async def trigger_harvester() -> Dict[str, Any]:
         return await harvester.harvest_all()
+
+    @app.get("/api/providers/ping", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
+    async def ping_providers() -> Dict[str, Any]:
+        results = []
+        providers_list = ["groq", "openrouter", "gemini", "github"]
+        all_models = await storage_db.get_active_models(config.db_path)
+        for p_name in providers_list:
+            pcfg = getattr(config.providers, p_name, None)
+            if not pcfg or not pcfg.enabled:
+                results.append({
+                    "provider": p_name,
+                    "status": "disabled",
+                    "message": "Đã tắt trong cấu hình",
+                    "models_count": 0,
+                })
+                continue
+            api_key = get_provider_api_key(p_name, config)
+            if not api_key:
+                results.append({
+                    "provider": p_name,
+                    "status": "no_key",
+                    "message": f"Thiếu API Key ({pcfg.api_key_env or 'chưa điền'})",
+                    "models_count": 0,
+                })
+                continue
+            is_cd = await storage_db.is_provider_in_cooldown(config.db_path, p_name)
+            if is_cd:
+                results.append({
+                    "provider": p_name,
+                    "status": "cooldown",
+                    "message": "Đang trong Cooldown 429",
+                    "models_count": 0,
+                })
+                continue
+            p_models = [m for m in all_models if m.get("provider") == p_name]
+            results.append({
+                "provider": p_name,
+                "status": "ready",
+                "message": f"Sẵn sàng ({len(p_models)} model)",
+                "models_count": len(p_models),
+            })
+        return {"providers": results}
 
     # --- Mount OpenAI Compatible Proxy Router ---
     openai_router = create_openai_router(

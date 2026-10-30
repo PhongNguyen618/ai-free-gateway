@@ -224,6 +224,9 @@
       <button onclick="switchTab('tab-dlp')" id="btn-tab-dlp" class="tab-btn">
         <span>🛡️ DLP Audit Logs</span>
       </button>
+      <button onclick="switchTab('tab-playground')" id="btn-tab-playground" class="tab-btn">
+        <span>💬 Playground & Ping Test</span>
+      </button>
     </div>
 
     <!-- Tab 1: Models Pool (Default Active Tab) -->
@@ -282,6 +285,64 @@
       <div id="quotas-container" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem;"></div>
     </div>
 
+    <!-- Tab 5: Playground & Ping Test -->
+    <div id="tab-playground" class="hidden" style="display: flex; flex-direction: column; gap: 1.5rem;">
+      <!-- Section 1: Ping Providers -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">🔌 Kiểm Tra Sẵn Sàng Các Nhà Cung Cấp (Providers)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Kiểm tra API Key, trạng thái Cooldown 429 và số lượng model khả dụng hiện tại.</p>
+          </div>
+          <button class="btn btn-emerald" onclick="pingProviders()">⚡ Ping Kiểm Tra Ngay</button>
+        </div>
+        <div id="providers-ping-container" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem;">
+          <div style="font-size: 0.75rem; color: #64748b; padding: 0.5rem 0;">Bấm nút "Ping Kiểm Tra Ngay" để quét trạng thái các provider.</div>
+        </div>
+      </div>
+
+      <!-- Section 2: Live Chat Playground -->
+      <div class="card" style="display: flex; flex-direction: column; gap: 1rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">🧪 Thử Nghiệm Trực Tiếp (Live Playground)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Gửi prompt trực tiếp qua Gateway để kiểm tra tốc độ phản hồi và chuỗi fallback tự động.</p>
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.75rem;">
+            <label style="font-size: 0.75rem; color: #94a3b8; display: flex; align-items: center; gap: 0.35rem;">
+              <input type="checkbox" id="playground-stream" checked> Streaming (SSE)
+            </label>
+            <select id="playground-model-select" class="input-text" style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.75rem; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.375rem;">
+              <option value="">Tự động (Primary / Fallback Chain)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setPlaygroundPrompt('Xin chào, bạn là AI gì?')">Prompt mẫu: Xin chào</button>
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setPlaygroundPrompt('Viết một hàm Python tính dãy số Fibonacci đệ quy có ghi nhớ (memoization).')">Prompt mẫu: Code Python</button>
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setPlaygroundPrompt('Email liên hệ của tôi là dev@company.com và thẻ tín dụng 4532-1234-5678-9012. Hãy phân tích.')">Prompt mẫu: Test DLP Redact</button>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem;">
+          <textarea id="playground-input" rows="3" class="input-text" style="width: 100%; resize: vertical; background: #0b0f19; color: #e2e8f0; border: 1px solid #1e293b; border-radius: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.8125rem; font-family: inherit;" placeholder="Nhập câu hỏi hoặc prompt thử nghiệm tại đây..."></textarea>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div id="playground-meta" style="font-size: 0.75rem; color: #64748b; font-family: monospace;">Chưa gửi yêu cầu</div>
+          <div style="display: flex; gap: 0.5rem;">
+            <button class="btn btn-slate" onclick="clearPlayground()">Xóa</button>
+            <button class="btn btn-emerald" id="playground-send-btn" onclick="sendPlaygroundMessage()">🚀 Gửi Yêu Cầu</button>
+          </div>
+        </div>
+
+        <!-- Output display -->
+        <div style="background: #0b0f19; border: 1px solid #1e293b; border-radius: 0.5rem; padding: 1rem; min-height: 120px; max-height: 400px; overflow-y: auto;">
+          <div id="playground-output" style="font-size: 0.8125rem; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: #cbd5e1;">Phản hồi từ AI Gateway sẽ hiển thị tại đây...</div>
+        </div>
+      </div>
+    </div>
+
   </main>
 
   <!-- Auth Key Modal -->
@@ -319,7 +380,184 @@
       } else {
         sessionStorage.removeItem('gateway_api_key');
       }
-      updateAuthStatusUI();
+      // --- Live Playground & Provider Ping ---
+    function setPlaygroundPrompt(text) {
+      const input = document.getElementById('playground-input');
+      if (input) input.value = text;
+    }
+
+    function clearPlayground() {
+      const input = document.getElementById('playground-input');
+      const output = document.getElementById('playground-output');
+      const meta = document.getElementById('playground-meta');
+      if (input) input.value = '';
+      if (output) output.textContent = 'Phản hồi từ AI Gateway sẽ hiển thị tại đây...';
+      if (meta) meta.textContent = 'Chưa gửi yêu cầu';
+    }
+
+    async function pingProviders() {
+      const container = document.getElementById('providers-ping-container');
+      if (!container) return;
+      container.textContent = 'Đang kiểm tra kết nối các provider...';
+      try {
+        const res = await apiFetch('/api/providers/ping');
+        if (!res || !res.ok) {
+          container.textContent = 'Không thể kiểm tra kết nối (Lỗi HTTP).';
+          return;
+        }
+        const data = await res.json();
+        container.textContent = '';
+        (data.providers || []).forEach(p => {
+          const card = createEl('div');
+          card.style.background = 'rgba(15, 23, 42, 0.7)';
+          card.style.border = '1px solid #1e293b';
+          card.style.borderRadius = '0.5rem';
+          card.style.padding = '0.75rem';
+          card.style.display = 'flex';
+          card.style.flexDirection = 'column';
+          card.style.gap = '0.25rem';
+
+          const topRow = createEl('div');
+          topRow.style.display = 'flex';
+          topRow.style.justifyContent = 'space-between';
+          topRow.style.alignItems = 'center';
+
+          const name = createEl('span', '', p.provider.toUpperCase());
+          name.style.fontWeight = '700';
+          name.style.fontSize = '0.75rem';
+          name.style.color = '#fff';
+          topRow.appendChild(name);
+
+          let badgeClass = 'badge badge-slate';
+          let statusText = 'ĐÃ TẮT';
+          if (p.status === 'ready') {
+            badgeClass = 'badge badge-emerald';
+            statusText = 'SẴN SÀNG';
+          } else if (p.status === 'cooldown') {
+            badgeClass = 'badge badge-rose';
+            statusText = 'COOLDOWN 429';
+          } else if (p.status === 'no_key') {
+            badgeClass = 'badge badge-amber';
+            statusText = 'THIẾU KEY';
+          }
+          const badge = createEl('span', badgeClass, statusText);
+          topRow.appendChild(badge);
+
+          const desc = createEl('div', '', p.message);
+          desc.style.fontSize = '0.6875rem';
+          desc.style.color = '#94a3b8';
+
+          card.appendChild(topRow);
+          card.appendChild(desc);
+          container.appendChild(card);
+        });
+      } catch (err) {
+        container.textContent = 'Lỗi kết nối tới Gateway API: ' + err.message;
+      }
+    }
+
+    async function sendPlaygroundMessage() {
+      const input = document.getElementById('playground-input');
+      const output = document.getElementById('playground-output');
+      const meta = document.getElementById('playground-meta');
+      const sendBtn = document.getElementById('playground-send-btn');
+      const streamCheck = document.getElementById('playground-stream');
+      const modelSelect = document.getElementById('playground-model-select');
+
+      const prompt = (input ? input.value : '').trim();
+      if (!prompt) {
+        showToast('Vui lòng nhập nội dung prompt trước khi gửi!', true);
+        return;
+      }
+
+      const isStream = streamCheck ? streamCheck.checked : true;
+      const selectedModel = (modelSelect && modelSelect.value) ? modelSelect.value : 'auto';
+
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Đang gọi AI...';
+      output.textContent = '';
+      meta.textContent = 'Đang kết nối tới mô hình AI...';
+
+      const startTime = performance.now();
+      const headers = { 'Content-Type': 'application/json' };
+      const apiKey = getApiKey();
+      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+
+      const payload = {
+        model: selectedModel,
+        messages: [{ role: 'user', content: prompt }],
+        stream: isStream,
+      };
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(payload),
+        });
+
+        const elapsedMs = Math.round(performance.now() - startTime);
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          const errMsg = errData.error?.message || `HTTP ${response.status} ${response.statusText}`;
+          output.textContent = `[Lỗi Gateway ${response.status}]: ${errMsg}`;
+          meta.textContent = `Thất bại sau ${elapsedMs}ms`;
+          return;
+        }
+
+        if (isStream) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+          let totalTokens = 0;
+          let servedModel = selectedModel;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('data: ')) {
+                const dataVal = trimmed.substring(6).trim();
+                if (dataVal === '[DONE]') break;
+                try {
+                  const chunk = JSON.parse(dataVal);
+                  if (chunk.model) servedModel = chunk.model;
+                  const delta = chunk.choices?.[0]?.delta;
+                  if (delta?.content) {
+                    output.textContent += delta.content;
+                    totalTokens++;
+                  } else if (chunk.error) {
+                    output.textContent += `\n[Lỗi Stream]: ${chunk.error.message || JSON.stringify(chunk.error)}`;
+                  }
+                } catch (e) {}
+              }
+            }
+          }
+          const totalMs = Math.round(performance.now() - startTime);
+          meta.textContent = `Phục vụ bởi: ${servedModel} | Thời gian: ${totalMs}ms | Tokens: ~${totalTokens}`;
+        } else {
+          const json = await response.json();
+          const content = json.choices?.[0]?.message?.content || JSON.stringify(json, null, 2);
+          output.textContent = content;
+          const totalMs = Math.round(performance.now() - startTime);
+          meta.textContent = `Phục vụ bởi: ${json.model || selectedModel} | Thời gian: ${totalMs}ms | Tokens: ${json.usage?.total_tokens || 'N/A'}`;
+        }
+      } catch (err) {
+        output.textContent = '[Lỗi kết nối]: ' + err.message;
+        meta.textContent = 'Gặp lỗi trong quá trình kết nối';
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = '🚀 Gửi Yêu Cầu';
+      }
+    }
+
+    updateAuthStatusUI();
     }
 
     function updateAuthStatusUI() {
@@ -386,7 +624,7 @@
 
     function switchTab(tabId) {
       currentTab = tabId;
-      ['tab-approvals', 'tab-models', 'tab-dlp', 'tab-quotas'].forEach(id => {
+      ['tab-approvals', 'tab-models', 'tab-dlp', 'tab-quotas', 'tab-playground'].forEach(id => {
         const el = document.getElementById(id);
         const btn = document.getElementById('btn-' + id);
         if (id === tabId) {
@@ -612,6 +850,16 @@
           'openrouter': 'Free ($0) | ~20 RPM / 200 RPD',
           'github': '8k TPM | 15 RPM | 150 RPD'
         };
+
+        const modelSelect = document.getElementById('playground-model-select');
+        if (modelSelect && modelSelect.options.length <= 1 && models && models.length > 0) {
+          models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = `${m.provider}: ${m.model_name || m.id}`;
+            modelSelect.appendChild(opt);
+          });
+        }
 
         models.forEach(m => {
           const tr = createEl('tr');
@@ -1072,6 +1320,183 @@
       if (currentTab === 'tab-models') fetchModels();
       if (currentTab === 'tab-dlp') fetchDlpLogs();
       if (currentTab === 'tab-quotas') fetchQuotas();
+    }
+
+    // --- Live Playground & Provider Ping ---
+    function setPlaygroundPrompt(text) {
+      const input = document.getElementById('playground-input');
+      if (input) input.value = text;
+    }
+
+    function clearPlayground() {
+      const input = document.getElementById('playground-input');
+      const output = document.getElementById('playground-output');
+      const meta = document.getElementById('playground-meta');
+      if (input) input.value = '';
+      if (output) output.textContent = 'Phản hồi từ AI Gateway sẽ hiển thị tại đây...';
+      if (meta) meta.textContent = 'Chưa gửi yêu cầu';
+    }
+
+    async function pingProviders() {
+      const container = document.getElementById('providers-ping-container');
+      if (!container) return;
+      container.textContent = 'Đang kiểm tra kết nối các provider...';
+      try {
+        const res = await apiFetch('/api/providers/ping');
+        if (!res || !res.ok) {
+          container.textContent = 'Không thể kiểm tra kết nối (Lỗi HTTP).';
+          return;
+        }
+        const data = await res.json();
+        container.textContent = '';
+        (data.providers || []).forEach(p => {
+          const card = createEl('div');
+          card.style.background = 'rgba(15, 23, 42, 0.7)';
+          card.style.border = '1px solid #1e293b';
+          card.style.borderRadius = '0.5rem';
+          card.style.padding = '0.75rem';
+          card.style.display = 'flex';
+          card.style.flexDirection = 'column';
+          card.style.gap = '0.25rem';
+
+          const topRow = createEl('div');
+          topRow.style.display = 'flex';
+          topRow.style.justifyContent = 'space-between';
+          topRow.style.alignItems = 'center';
+
+          const name = createEl('span', '', p.provider.toUpperCase());
+          name.style.fontWeight = '700';
+          name.style.fontSize = '0.75rem';
+          name.style.color = '#fff';
+          topRow.appendChild(name);
+
+          let badgeClass = 'badge badge-slate';
+          let statusText = 'ĐÃ TẮT';
+          if (p.status === 'ready') {
+            badgeClass = 'badge badge-emerald';
+            statusText = 'SẴN SÀNG';
+          } else if (p.status === 'cooldown') {
+            badgeClass = 'badge badge-rose';
+            statusText = 'COOLDOWN 429';
+          } else if (p.status === 'no_key') {
+            badgeClass = 'badge badge-amber';
+            statusText = 'THIẾU KEY';
+          }
+          const badge = createEl('span', badgeClass, statusText);
+          topRow.appendChild(badge);
+
+          const desc = createEl('div', '', p.message);
+          desc.style.fontSize = '0.6875rem';
+          desc.style.color = '#94a3b8';
+
+          card.appendChild(topRow);
+          card.appendChild(desc);
+          container.appendChild(card);
+        });
+      } catch (err) {
+        container.textContent = 'Lỗi kết nối tới Gateway API: ' + err.message;
+      }
+    }
+
+    async function sendPlaygroundMessage() {
+      const input = document.getElementById('playground-input');
+      const output = document.getElementById('playground-output');
+      const meta = document.getElementById('playground-meta');
+      const sendBtn = document.getElementById('playground-send-btn');
+      const streamCheck = document.getElementById('playground-stream');
+      const modelSelect = document.getElementById('playground-model-select');
+
+      const prompt = (input ? input.value : '').trim();
+      if (!prompt) {
+        showToast('Vui lòng nhập nội dung prompt trước khi gửi!', true);
+        return;
+      }
+
+      const isStream = streamCheck ? streamCheck.checked : true;
+      const selectedModel = (modelSelect && modelSelect.value) ? modelSelect.value : 'auto';
+
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Đang gọi AI...';
+      output.textContent = '';
+      meta.textContent = 'Đang kết nối tới mô hình AI...';
+
+      const startTime = performance.now();
+      const headers = { 'Content-Type': 'application/json' };
+      const apiKey = getApiKey();
+      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+
+      const payload = {
+        model: selectedModel,
+        messages: [{ role: 'user', content: prompt }],
+        stream: isStream,
+      };
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(payload),
+        });
+
+        const elapsedMs = Math.round(performance.now() - startTime);
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          const errMsg = errData.error?.message || `HTTP ${response.status} ${response.statusText}`;
+          output.textContent = `[Lỗi Gateway ${response.status}]: ${errMsg}`;
+          meta.textContent = `Thất bại sau ${elapsedMs}ms`;
+          return;
+        }
+
+        if (isStream) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+          let totalTokens = 0;
+          let servedModel = selectedModel;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('data: ')) {
+                const dataVal = trimmed.substring(6).trim();
+                if (dataVal === '[DONE]') break;
+                try {
+                  const chunk = JSON.parse(dataVal);
+                  if (chunk.model) servedModel = chunk.model;
+                  const delta = chunk.choices?.[0]?.delta;
+                  if (delta?.content) {
+                    output.textContent += delta.content;
+                    totalTokens++;
+                  } else if (chunk.error) {
+                    output.textContent += `\n[Lỗi Stream]: ${chunk.error.message || JSON.stringify(chunk.error)}`;
+                  }
+                } catch (e) {}
+              }
+            }
+          }
+          const totalMs = Math.round(performance.now() - startTime);
+          meta.textContent = `Phục vụ bởi: ${servedModel} | Thời gian: ${totalMs}ms | Tokens: ~${totalTokens}`;
+        } else {
+          const json = await response.json();
+          const content = json.choices?.[0]?.message?.content || JSON.stringify(json, null, 2);
+          output.textContent = content;
+          const totalMs = Math.round(performance.now() - startTime);
+          meta.textContent = `Phục vụ bởi: ${json.model || selectedModel} | Thời gian: ${totalMs}ms | Tokens: ${json.usage?.total_tokens || 'N/A'}`;
+        }
+      } catch (err) {
+        output.textContent = '[Lỗi kết nối]: ' + err.message;
+        meta.textContent = 'Gặp lỗi trong quá trình kết nối';
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = '🚀 Gửi Yêu Cầu';
+      }
     }
 
     updateAuthStatusUI();
