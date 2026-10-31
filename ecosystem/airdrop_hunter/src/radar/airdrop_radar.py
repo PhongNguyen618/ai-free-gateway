@@ -285,6 +285,8 @@ class AirdropRadar:
             score = self.calculate_alpha_score(cand)
             cand_copy = dict(cand)
             cand_copy["alpha_score"] = score
+            if "source" not in cand_copy:
+                cand_copy["source"] = "CURATED_STATIC"
             self.db.upsert_campaign(cand_copy)
             evaluated.append(cand_copy)
 

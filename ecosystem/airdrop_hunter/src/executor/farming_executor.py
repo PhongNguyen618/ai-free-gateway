@@ -70,9 +70,17 @@ class FarmingExecutor:
         now_iso = now_dt.isoformat()
 
         # Thực thi On-Chain tương tác thật trên Base L2
-        from ecosystem.airdrop_hunter.src.executor.onchain_signer import BaseWethSigner
+        from ecosystem.airdrop_hunter.src.executor.onchain_signer import BaseWethSigner, BASE_WETH_ADDRESS
+        from ecosystem.airdrop_hunter.src.executor.reward_harvester import RewardHarvester
+        harvester = RewardHarvester(db=self.db)
+        bal_data = harvester.audit_real_onchain_balances(wallet_address)
+        weth_bal = bal_data.get("weth_balance", 0.0)
+
+        # Nếu đã có WETH thì unwrap về ETH, nếu chưa có thì wrap ETH -> WETH
+        action = "unwrap" if weth_bal >= 0.00005 else "wrap"
+
         signer = BaseWethSigner()
-        weth_res = signer.execute_weth_cycle(wallet_address=wallet_address, action="unwrap", amount_eth=0.00005)
+        weth_res = signer.execute_weth_cycle(wallet_address=wallet_address, action=action, amount_eth=0.00005)
 
         tx_hash = weth_res.get("tx_hash")
         live_ok = bool(weth_res.get("live_verified"))
@@ -84,7 +92,7 @@ class FarmingExecutor:
             campaign_id=campaign_id,
             action_type="DAILY_CHECKIN",
             status=status,
-            details=f"Daily Check-in on-chain (Verified: {live_ok})",
+            details=f"Daily Check-in on-chain {action.upper()} (Verified: {live_ok})",
             cost_usd=cost_usd,
             tx_hash=tx_hash or "",
         )
@@ -105,30 +113,19 @@ class FarmingExecutor:
         }
 
     def execute_faucet_claim(self, wallet_address: str, campaign_id: str) -> Dict[str, Any]:
-        """Claims free testnet tokens from faucet (0đ cost)."""
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        self.db.record_execution(
-            wallet_address=wallet_address,
-            campaign_id=campaign_id,
-            action_type="FAUCET_CLAIM",
-            status="SUCCESS",
-            details="Faucet claim verified on-chain",
-            cost_usd=0.0,
-            tx_hash="",
-        )
-        self.db.update_wallet_activity(wallet_address, today_str, cost_usd=0.0, points_add=10)
-
+        """Claims free testnet tokens from faucet (Fail-Closed)."""
         return {
-            "status": "SUCCESS",
+            "status": "NOT_SUPPORTED",
             "action": "FAUCET_CLAIM",
             "wallet": wallet_address,
             "campaign_id": campaign_id,
-            "points_earned": 10,
+            "points_earned": 0,
             "cost_usd": 0.0,
             "tx_hash": None,
-            "live_verified": True,
+            "live_verified": False,
+            "message": "Chiến dịch chưa liên kết hợp đồng Faucet on-chain xác minh. Hệ thống Fail-Closed từ chối cộng điểm ảo.",
         }
+
 
 
     def execute_micro_swap(
@@ -221,15 +218,17 @@ class FarmingExecutor:
                         "explanation": res.get("explanation", "AI reasoning verified."),
                     }
         except Exception as e:
-            logger.warning(f"AI Quiz Solver fallback: {e}")
+            logger.warning(f"AI Quiz Solver error: {e}")
 
-        # Fallback to option 0 if AI unavailable
+        # Fail-closed: Tuyệt đối không tự chọn bừa đáp án 0
         return {
             "question": question,
-            "selected_index": 0,
-            "selected_option": options[0] if options else "",
-            "explanation": "Default selection fallback.",
+            "selected_index": -1,
+            "selected_option": "",
+            "explanation": "AI Solver không phản hồi. Hệ thống từ chối đoán bừa.",
+            "status": "AI_UNAVAILABLE",
         }
+
 
     def run_daily_cycle_for_wallet(
         self,

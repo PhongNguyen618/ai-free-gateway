@@ -128,12 +128,29 @@ def build_hub_node(
         target_wallets = wallets or []
         if not target_wallets:
             stored = db.list_wallets()
-            target_wallets = [w["address"] for w in stored] or [
-                "0x71c6bf00a49be0834277b0292bfef32342ef0123",
-                "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260456",
-            ]
+            target_wallets = [w["address"] for w in stored]
+        
+        if not target_wallets:
+            # Thử lấy từ EVM_PRIVATE_KEY
+            pk = os.getenv("EVM_PRIVATE_KEY", "").strip()
+            if pk:
+                try:
+                    from eth_account import Account
+                    addr = Account.from_key(pk).address
+                    db.upsert_wallet(addr)
+                    target_wallets = [addr]
+                except Exception:
+                    pass
 
-        sample_tasks = ["faucet_claim", "daily_checkin", "micro_swap"]
+        if not target_wallets:
+            return {
+                "wallets_count": 0,
+                "status": "NO_WALLETS_CONFIGURED",
+                "message": "Chưa cấu hình ví farming nào. Vui lòng thêm ví thật vào Dashboard.",
+                "schedule": {},
+            }
+
+        sample_tasks = ["daily_checkin", "micro_swap"]
         plan = persona_engine.plan_daily_schedule(target_wallets, sample_tasks)
         return {
             "wallets_count": len(plan),
@@ -158,16 +175,26 @@ def build_hub_node(
             if stored:
                 wallets_to_run = [w["address"] for w in stored]
             else:
-                demo_wallets = [
-                    "0x71c6bf00a49be0834277b0292bfef32342ef0123",
-                    "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260456",
-                ]
-                for dw in demo_wallets:
-                    db.upsert_wallet(dw)
-                wallets_to_run = demo_wallets
+                pk = os.getenv("EVM_PRIVATE_KEY", "").strip()
+                if pk:
+                    try:
+                        from eth_account import Account
+                        addr = Account.from_key(pk).address
+                        db.upsert_wallet(addr)
+                        wallets_to_run = [addr]
+                    except Exception:
+                        pass
         else:
             db.upsert_wallet(target)
             wallets_to_run = [target]
+
+        if not wallets_to_run:
+            return {
+                "status": "NO_WALLETS_CONFIGURED",
+                "message": "Chưa có ví nào được cấu hình trong hệ thống hoặc qua EVM_PRIVATE_KEY. Hệ thống Fail-Closed từ chối chạy trên ví ảo.",
+                "results": [],
+            }
+
 
         results = []
         total_points = 0
@@ -241,9 +268,20 @@ def build_hub_node(
         wallets_to_check = []
         if wallet_address.upper() == "ALL":
             stored = db.list_wallets()
-            wallets_to_check = [w["address"] for w in stored] or ["0x71c6bf00a49be0834277b0292bfef32342ef0123"]
+            if stored:
+                wallets_to_check = [w["address"] for w in stored]
+            else:
+                pk = os.getenv("EVM_PRIVATE_KEY", "").strip()
+                if pk:
+                    try:
+                        from eth_account import Account
+                        addr = Account.from_key(pk).address
+                        wallets_to_check = [addr]
+                    except Exception:
+                        pass
         else:
             wallets_to_check = [wallet_address]
+
 
         health_reports = []
         for addr in wallets_to_check:

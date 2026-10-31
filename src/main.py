@@ -662,6 +662,42 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             "solana": sol_data,
         }
 
+    @app.post("/api/hub/live/pause", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_live_pause() -> Dict[str, Any]:
+        """Kill-switch: Tạm dừng toàn bộ các lệnh mua mới (chỉ cho phép bán chốt lời/SL)."""
+        from ecosystem.smart_money.dex_executor import live_dex_executor
+        live_dex_executor.pause_buys = True
+        return {"status": "PAUSED", "pause_buys": True, "message": "Đã kích hoạt tạm dừng mua mới thành công."}
+
+    @app.post("/api/hub/live/resume", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_live_resume() -> Dict[str, Any]:
+        """Bật lại cho phép mở lệnh mua mới."""
+        from ecosystem.smart_money.dex_executor import live_dex_executor
+        live_dex_executor.pause_buys = False
+        return {"status": "RESUMED", "pause_buys": False, "message": "Đã cho phép mở vị thế mua bình thường."}
+
+    @app.post("/api/hub/live/panic-sell", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_live_panic_sell() -> Dict[str, Any]:
+        """Khẩn cấp: Bán thanh lý toàn bộ 100% token của tất cả vị thế đang mở ra tiền mặt."""
+        from ecosystem.smart_money.hub_bridge import position_manager
+        open_positions = position_manager.get_open_positions()
+        results = []
+        for pos in open_positions:
+            closed_pos = position_manager.close_position_manual(pos.position_id, reason="PANIC_SELL_ALL")
+            results.append({
+                "position_id": pos.position_id,
+                "symbol": pos.token_symbol,
+                "status": "CLOSED",
+                "realized_usd": closed_pos.realized_usd if closed_pos else 0.0,
+            })
+        return {
+            "status": "PANIC_SELL_COMPLETED",
+            "closed_count": len(results),
+            "positions": results,
+            "message": f"Đã thanh lý khẩn cấp {len(results)} vị thế ra tiền mặt.",
+        }
+
+
 
     # --- Mount OpenAI Compatible Proxy Router ---
     openai_router = create_openai_router(

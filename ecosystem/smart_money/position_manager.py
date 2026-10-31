@@ -118,7 +118,40 @@ class TieredPositionManager:
             )
             conn.commit()
 
+    def _dispatch_live_sell(self, pos: PositionState, sell_pct: float) -> Tuple[bool, Optional[str]]:
+        """Thực thi lệnh bán on-chain thật qua DEX Executor nếu ENABLE_LIVE_EXECUTION=true."""
+        if os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() not in ("true", "1", "yes"):
+            return True, None
+        try:
+            try:
+                from ecosystem.smart_money.dex_executor import live_dex_executor
+            except ImportError:
+                from dex_executor import live_dex_executor
+            import asyncio
+            loop = asyncio.new_event_loop()
+            try:
+                res = loop.run_until_complete(
+                    live_dex_executor.execute_sell_pct(
+                        chain=pos.chain,
+                        token_address=pos.token_address,
+                        sell_pct=sell_pct,
+                        position_id=pos.position_id,
+                    )
+                )
+            finally:
+                loop.close()
+
+            if res.get("success"):
+                return True, res.get("tx_hash")
+            else:
+                logger.error(f"DEX Sell Failed: {res.get('error')} - {res.get('message')}")
+                return False, None
+        except Exception as e:
+            logger.error(f"Live sell dispatch exception: {e}")
+            return False, None
+
     def open_position(
+
         self,
         token_address: str,
         token_symbol: str,
@@ -155,11 +188,18 @@ class TieredPositionManager:
             if not res.get("success"):
                 if os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
                     raise RuntimeError(f"On-Chain Execution Failed: {res.get('message', res.get('error'))}")
+                elif os.getenv("PAPER_MODE", "false").lower() not in ("true", "1", "yes"):
+                    raise RuntimeError("Hệ thống đang tắt ENABLE_LIVE_EXECUTION. Không thể mở lệnh khi chưa bật chế độ Live.")
             else:
                 onchain_tx_hash = res.get("tx_hash")
+                if res.get("received_qty", 0.0) > 0:
+                    initial_quantity = res.get("received_qty")
+                if res.get("effective_price_usd", 0.0) > 0:
+                    entry_price_usd = res.get("effective_price_usd")
 
         qty = initial_quantity if (initial_quantity and initial_quantity > 0) else (invested_usd / entry_price_usd)
         hard_sl = entry_price_usd * 0.82  # -18% hard stop loss
+
 
         pos_id = f"pos_{clean_chain}_{int(time.time())}_{clean_symbol}"
         initial_event = f"Vào lệnh mua ${invested_usd:.2f} ({qty:.4f} {clean_symbol}) tại giá ${entry_price_usd:.6f}. SL cứng -18%."
@@ -223,27 +263,47 @@ class TieredPositionManager:
         # 0. Emergency Rug/Liquidity check
         if liquidity_usd is not None and liquidity_usd < 10000:
             msg = f"CẢNH BÁO RÚT THANH KHOẢN: Liquidity giảm còn ${liquidity_usd:.0f}! Thoát toàn bộ vị thế khẩn cấp."
+            sell_ok, tx_hash = self._dispatch_live_sell(pos, sell_pct=100.0)
+            if not sell_ok and os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                fail_msg = f"🚨 [RUG-PULL SELL FAILED] Không thể khớp lệnh bán khẩn cấp {pos.token_symbol} trên DEX!"
+                pos.events_log.append(fail_msg)
+                self._save_position(pos)
+                self._notify_event("smart_money.sell_failed", {"position_id": pos.position_id, "symbol": pos.token_symbol, "error": fail_msg})
+                return pos, [fail_msg]
+
             pos.status = "CLOSED"
             pos.closed_at = now_ts
             pos.close_reason = "EMERGENCY_RUG_PULL"
             pos.realized_usd += pos.remaining_quantity * current_price_usd
             pos.remaining_quantity = 0.0
             pos.remaining_pct = 0.0
+            if tx_hash:
+                msg += f" [On-Chain Tx: {tx_hash}]"
             pos.events_log.append(msg)
             triggered_actions.append(msg)
             self._save_position(pos)
-            self._notify_event("smart_money.emergency_exit", {"position_id": pos.position_id, "symbol": pos.token_symbol, "reason": msg})
+            self._notify_event("smart_money.emergency_exit", {"position_id": pos.position_id, "symbol": pos.token_symbol, "reason": msg, "tx_hash": tx_hash})
             return pos, triggered_actions
 
         # 1. Check Stop-Loss
         if current_price_usd <= pos.stop_loss_price_usd and pos.status != "CLOSED":
             msg = f"CHẠM STOP-LOSS: Giá ${current_price_usd:.6f} chạm mức dừng lỗ ${pos.stop_loss_price_usd:.6f}. Đóng toàn bộ {pos.remaining_pct*100:.0f}% còn lại."
+            sell_ok, tx_hash = self._dispatch_live_sell(pos, sell_pct=100.0)
+            if not sell_ok and os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                fail_msg = f"🚨 [STOP-LOSS SELL FAILED] Khớp lệnh bán dừng lỗ {pos.token_symbol} thất bại trên DEX!"
+                pos.events_log.append(fail_msg)
+                self._save_position(pos)
+                self._notify_event("smart_money.sell_failed", {"position_id": pos.position_id, "symbol": pos.token_symbol, "error": fail_msg})
+                return pos, [fail_msg]
+
             pos.status = "CLOSED"
             pos.closed_at = now_ts
             pos.close_reason = "STOP_LOSS_HIT"
             pos.realized_usd += pos.remaining_quantity * current_price_usd
             pos.remaining_quantity = 0.0
             pos.remaining_pct = 0.0
+            if tx_hash:
+                msg += f" [On-Chain Tx: {tx_hash}]"
             pos.events_log.append(msg)
             triggered_actions.append(msg)
             self._save_position(pos)
@@ -252,20 +312,30 @@ class TieredPositionManager:
                 "symbol": pos.token_symbol,
                 "final_realized_usd": pos.realized_usd,
                 "total_return_usd": pos.total_return_usd,
+                "tx_hash": tx_hash,
             })
             return pos, triggered_actions
 
         # 2. Tier 1 TP: +40% (1.4x) -> Sell 35% initial qty, move SL to breakeven (+2%)
         if mult >= 1.40 and not pos.tp1_hit and pos.remaining_pct > 0.65:
             sell_qty = pos.initial_quantity * 0.35
+            pct_to_sell_now = (0.35 / pos.remaining_pct) * 100.0
+            sell_ok, tx_hash = self._dispatch_live_sell(pos, sell_pct=pct_to_sell_now)
+            if not sell_ok and os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                fail_msg = f"⚠️ [TP1 SELL FAILED] Khớp lệnh bán chốt lời TP1 {pos.token_symbol} thất bại trên DEX!"
+                pos.events_log.append(fail_msg)
+                self._save_position(pos)
+                return pos, [fail_msg]
+
             sell_val = sell_qty * current_price_usd
             pos.realized_usd += sell_val
             pos.remaining_quantity -= sell_qty
             pos.remaining_pct = round(pos.remaining_quantity / pos.initial_quantity, 4)
             pos.tp1_hit = True
-            # Move Stop-Loss to Breakeven (+2% to cover gas/slippage)
             pos.stop_loss_price_usd = pos.entry_price_usd * 1.02
             msg = f"🎯 [TP1 +40%] Bán 35% token ({sell_qty:.4f} {pos.token_symbol}) thu về ${sell_val:.2f}. Dời SL lên Hòa Vốn ($+{pos.stop_loss_price_usd:.6f}). Lệnh đã an toàn 100%!"
+            if tx_hash:
+                msg += f" [On-Chain Tx: {tx_hash}]"
             pos.events_log.append(msg)
             triggered_actions.append(msg)
             self._notify_event("smart_money.partial_tp_hit", {
@@ -274,19 +344,29 @@ class TieredPositionManager:
                 "symbol": pos.token_symbol,
                 "sold_usd": sell_val,
                 "new_stop_loss": pos.stop_loss_price_usd,
+                "tx_hash": tx_hash,
             })
 
         # 3. Tier 2 TP: +100% (2.0x / X2) -> Sell 30% initial qty, move trailing SL to +40%
         if mult >= 2.0 and not pos.tp2_hit and pos.remaining_pct > 0.35:
             sell_qty = pos.initial_quantity * 0.30
+            pct_to_sell_now = (0.30 / pos.remaining_pct) * 100.0
+            sell_ok, tx_hash = self._dispatch_live_sell(pos, sell_pct=pct_to_sell_now)
+            if not sell_ok and os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                fail_msg = f"⚠️ [TP2 SELL FAILED] Khớp lệnh bán chốt lời TP2 {pos.token_symbol} thất bại trên DEX!"
+                pos.events_log.append(fail_msg)
+                self._save_position(pos)
+                return pos, [fail_msg]
+
             sell_val = sell_qty * current_price_usd
             pos.realized_usd += sell_val
             pos.remaining_quantity -= sell_qty
             pos.remaining_pct = round(pos.remaining_quantity / pos.initial_quantity, 4)
             pos.tp2_hit = True
-            # Move Trailing Stop up to +40%
             pos.stop_loss_price_usd = pos.entry_price_usd * 1.40
             msg = f"🔥 [TP2 X2 FREE RIDE] Bán tiếp 30% ({sell_qty:.4f} {pos.token_symbol}) thu về ${sell_val:.2f}. Tổng rút: ${pos.realized_usd:.2f} (Đạt {pos.realized_usd/pos.invested_usd*100:.0f}% vốn gốc). 35% còn lại là LÃI RÒNG 0 ĐỒNG!"
+            if tx_hash:
+                msg += f" [On-Chain Tx: {tx_hash}]"
             pos.events_log.append(msg)
             triggered_actions.append(msg)
             self._notify_event("smart_money.partial_tp_hit", {
@@ -295,20 +375,30 @@ class TieredPositionManager:
                 "symbol": pos.token_symbol,
                 "sold_usd": sell_val,
                 "new_stop_loss": pos.stop_loss_price_usd,
+                "tx_hash": tx_hash,
             })
 
         # 4. Tier 3 TP: +300% (4.0x / X4) -> Sell 15% initial qty, activate dynamic trailing stop (-35% from ATH)
         if mult >= 4.0 and not pos.tp3_hit and pos.remaining_pct > 0.20:
             sell_qty = pos.initial_quantity * 0.15
+            pct_to_sell_now = (0.15 / pos.remaining_pct) * 100.0
+            sell_ok, tx_hash = self._dispatch_live_sell(pos, sell_pct=pct_to_sell_now)
+            if not sell_ok and os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                fail_msg = f"⚠️ [TP3 SELL FAILED] Khớp lệnh bán chốt lời TP3 {pos.token_symbol} thất bại trên DEX!"
+                pos.events_log.append(fail_msg)
+                self._save_position(pos)
+                return pos, [fail_msg]
+
             sell_val = sell_qty * current_price_usd
             pos.realized_usd += sell_val
             pos.remaining_quantity -= sell_qty
             pos.remaining_pct = round(pos.remaining_quantity / pos.initial_quantity, 4)
             pos.tp3_hit = True
-            pos.status = "MOONBAG"  # Enter Moonbag status!
-            # Set dynamic trailing stop at -35% from highest price
+            pos.status = "MOONBAG"
             pos.stop_loss_price_usd = pos.highest_price_usd * 0.65
             msg = f"🚀 [TP3 X4 THU HOẠCH] Bán tiếp 15% ({sell_qty:.4f} {pos.token_symbol}) thu về ${sell_val:.2f}. Đã mở chế độ MOONBAG (Giữ {pos.remaining_pct*100:.0f}% gồng x10 ➔ x50+). Trailing Stop: -35% từ đỉnh."
+            if tx_hash:
+                msg += f" [On-Chain Tx: {tx_hash}]"
             pos.events_log.append(msg)
             triggered_actions.append(msg)
             self._notify_event("smart_money.partial_tp_hit", {
@@ -317,7 +407,9 @@ class TieredPositionManager:
                 "symbol": pos.token_symbol,
                 "sold_usd": sell_val,
                 "new_stop_loss": pos.stop_loss_price_usd,
+                "tx_hash": tx_hash,
             })
+
 
         # 5. Moonbag Stage 1: 10x (+900%) -> Sell 5% initial qty
         if mult >= 10.0 and not pos.moonbag_10x_hit and pos.remaining_quantity > 0:

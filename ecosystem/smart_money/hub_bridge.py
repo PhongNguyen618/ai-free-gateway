@@ -260,15 +260,28 @@ def tool_open_tiered_position(
                 p_usd = s.get("price_usd", 0.0)
                 break
         if p_usd <= 0:
-            p_usd = 0.05
+            return {
+                "status": "PRICE_UNAVAILABLE",
+                "message": f"Không thể lấy giá on-chain thời gian thực cho {token_symbol} ({token_address}). Hệ thống Fail-Closed từ chối dùng giá giả định.",
+                "live_verified": False,
+            }
 
-    pos = position_manager.open_position(
-        token_address=token_address,
-        token_symbol=token_symbol,
-        chain=chain,
-        entry_price_usd=p_usd,
-        invested_usd=float(invested_usd),
-    )
+    try:
+        pos = position_manager.open_position(
+            token_address=token_address,
+            token_symbol=token_symbol,
+            chain=chain,
+            entry_price_usd=p_usd,
+            invested_usd=float(invested_usd),
+            execute_onchain=True,
+        )
+    except Exception as exc:
+        return {
+            "status": "OPEN_POSITION_FAILED",
+            "message": str(exc),
+            "live_verified": False,
+        }
+
     return {
         "status": "OPENED",
         "position_id": pos.position_id,

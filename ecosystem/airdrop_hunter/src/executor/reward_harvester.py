@@ -85,22 +85,21 @@ class RewardHarvester:
         campaign: Dict[str, Any],
     ) -> Tuple[bool, float, str]:
         """
-        Determines if a wallet meets airdrop claim criteria.
+        Determines if a wallet meets airdrop criteria based on verified on-chain activity.
         Returns (is_eligible, estimated_value_usd, reason).
+        Fail-Closed: Tuyệt đối không bịa ra số USD ảo khi chưa claim token thực tế.
         """
         active_days = wallet.get("active_days", 0)
         points = wallet.get("points_accumulated", 0)
         alpha_score = campaign.get("alpha_score", 0.0)
 
-        # Realistic criteria: At least 3 active days or 50 points in high-alpha projects
         if active_days >= 3 and points >= 50 and alpha_score >= 80.0:
-            est_value = round(120.0 + (active_days * 15.5) + (points * 0.25), 2)
-            return True, est_value, f"High streak qualify ({active_days} days, {points} pts)"
+            return True, 0.0, f"Đạt chuẩn xếp hạng Tier-1 ({active_days} ngày on-chain, {points} điểm)"
         elif active_days >= 1 and points >= 20:
-            est_value = round(25.0 + (points * 0.10), 2)
-            return True, est_value, f"Tier-3 allocation qualify ({active_days} days)"
+            return True, 0.0, f"Đạt chuẩn xếp hạng Tier-3 ({active_days} ngày on-chain)"
         else:
-            return False, 0.0, f"Insufficient streak (need >=1 active day and >=20 pts)"
+            return False, 0.0, "Chưa đủ điều kiện streak (cần >=1 ngày active và >=20 điểm)"
+
 
     def record_discovered_reward(
         self,

@@ -1,12 +1,13 @@
-"""On-Chain Web3 Signer & DeFi Real Yield Scanner for Base L2.
+"""On-Chain Web3 Signer & DeFi Real Yield Scanner for Base L2 (Strict Live).
 
 Features:
 1. Base Canonical WETH Signer (0x4200000000000000000000000000000000000006):
    - Wrap (deposit) & Unwrap (withdraw): 0% DEX fee, 0% slippage, ~$0.0003 gas.
-   - Dual Mode: Real Web3 broadcast if EVM_PRIVATE_KEY is supplied, or safe simulation.
+   - Strict Live Execution: Chỉ ký giao dịch thật khi có private key và RPC phản hồi.
 2. DefiLlama Real Yield Scanner:
    - Scans live APY & TVL across Aave V3, Moonwell, Morpho, Aerodrome on Base.
 """
+
 
 from __future__ import annotations
 
@@ -48,12 +49,20 @@ class BaseWethSigner:
 
         # Step 1: Check live network gas price
         gas_price_gwei = self._get_gas_price_gwei()
+        if gas_price_gwei is None:
+            return {
+                "status": "RPC_GAS_PRICE_UNAVAILABLE",
+                "message": "Không thể kết nối RPC để lấy giá Gas thời gian thực trên mạng Base. Hủy lệnh để đảm bảo an toàn vốn.",
+                "live_verified": False,
+            }
         if gas_price_gwei > max_gas_gwei:
             return {
                 "status": "GAS_CEILING_EXCEEDED",
                 "message": f"Gas hiện tại ({gas_price_gwei:.4f} gwei) vượt trần an toàn ({max_gas_gwei:.4f} gwei). Hủy lệnh để bảo vệ vốn.",
                 "gas_price_gwei": gas_price_gwei,
+                "live_verified": False,
             }
+
 
         # Step 2: Strict Live On-Chain Transaction
         if not self.private_key or len(self.private_key.strip()) < 64:
@@ -104,7 +113,7 @@ class BaseWethSigner:
             }
 
 
-    def _get_gas_price_gwei(self) -> float:
+    def _get_gas_price_gwei(self) -> Optional[float]:
         payload = {"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}
         try:
             req = urllib.request.Request(
@@ -114,10 +123,13 @@ class BaseWethSigner:
             )
             with urllib.request.urlopen(req, timeout=4.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                wei = int(data.get("result", "0x11e1a300"), 16)
+                wei = int(data.get("result", "0x0"), 16)
+                if wei <= 0:
+                    return None
                 return round(wei / 1e9, 5)
         except Exception:
-            return 0.006
+            return None
+
 
     def _sign_and_broadcast_weth(self, action: str, amount_eth: float) -> str:
         """Internal helper to sign and broadcast raw transaction using eth_account."""

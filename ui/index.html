@@ -379,7 +379,10 @@
           <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
             <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="scanLiveMemeGems()">🔍 Quét DexScreener + GoPlus</button>
             <button class="btn btn-emerald" style="font-size: 0.6875rem;" onclick="syncMemePositions()">🔄 Quét Giá & Chốt Lời Tự Động</button>
+            <button class="btn btn-slate" style="font-size: 0.6875rem; border: 1px solid #f59e0b; color: #fbbf24;" onclick="toggleLivePauseBuys()">⏸️ Tạm Dừng Mua</button>
+            <button class="btn btn-slate" style="font-size: 0.6875rem; border: 1px solid #ef4444; color: #f87171;" onclick="triggerLivePanicSell()">🚨 Panic Sell All</button>
           </div>
+
         </div>
 
         <!-- Form Mở Vị Thế Nhanh -->
@@ -600,6 +603,7 @@
       }
       updateAuthStatusUI();
     }
+
 
     function updateAuthStatusUI() {
       const btnText = document.getElementById('auth-status-text');
@@ -2237,7 +2241,39 @@
       }
     }
 
+    async function toggleLivePauseBuys() {
+      try {
+        const resp = await apiFetch('/api/hub/live/pause', { method: 'POST' });
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          showToast('⏸️ ' + data.message);
+        } else {
+          showToast('Lỗi khi gửi lệnh tạm dừng mua', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
+    async function triggerLivePanicSell() {
+      if (!confirm('CẢNH BÁO: Bạn có chắc chắn muốn BÁN THANH LÝ KHẨN CẤP toàn bộ 100% token của tất cả vị thế đang mở trên DEX ra tiền mặt không?')) return;
+      showToast('🚨 Đang thực thi Panic Sell toàn bộ...');
+      try {
+        const resp = await apiFetch('/api/hub/live/panic-sell', { method: 'POST' });
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          showToast('✅ ' + data.message);
+          fetchMemePositions();
+        } else {
+          showToast('Lỗi gửi lệnh Panic Sell', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
     updateAuthStatusUI();
+
     refreshAll();
     setInterval(refreshAll, 3000);
   </script>

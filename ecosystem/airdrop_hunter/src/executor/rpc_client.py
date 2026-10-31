@@ -54,10 +54,10 @@ class MultiChainRPCClient:
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def get_native_balance(self, chain: str, address: str) -> Tuple[float, bool]:
+    def get_native_balance(self, chain: str, address: str) -> Tuple[Optional[float], bool]:
         """
         Returns (balance_native, is_live_rpc).
-        If offline or RPC fails, falls back gracefully to a simulated balance.
+        Fail-Closed: Nếu RPC lỗi hoặc không kết nối được, trả về (None, False).
         """
         chain_clean = chain.lower().strip()
         try:
@@ -71,28 +71,30 @@ class MultiChainRPCClient:
                 wei = int(hex_val, 16)
                 return round(wei / 1e18, 6), True
         except Exception as e:
-            logger.debug(f"RPC get_native_balance fallback for {chain} ({address[:8]}...): {e}")
-            return 0.05, False
+            logger.warning(f"RPC get_native_balance error for {chain} ({address[:8]}...): {e}")
+            return None, False
 
-    def get_transaction_count(self, chain: str, address: str) -> Tuple[int, bool]:
+    def get_transaction_count(self, chain: str, address: str) -> Tuple[Optional[int], bool]:
         """
         Returns (nonce_count, is_live_rpc).
+        Fail-Closed: Trả về None nếu RPC lỗi.
         """
         chain_clean = chain.lower().strip()
         if "solana" in chain_clean:
-            return 12, False  # Solana uses recent blockhashes rather than account nonces
+            return None, False  # Solana uses recent blockhashes rather than account nonces
 
         try:
             res = self._post_rpc(chain_clean, "eth_getTransactionCount", [address, "latest"])
             hex_val = res.get("result", "0x0")
             return int(hex_val, 16), True
         except Exception as e:
-            logger.debug(f"RPC get_transaction_count fallback for {chain}: {e}")
-            return 7, False
+            logger.warning(f"RPC get_transaction_count error for {chain}: {e}")
+            return None, False
 
-    def get_gas_price_gwei(self, chain: str) -> Tuple[float, bool]:
+    def get_gas_price_gwei(self, chain: str) -> Tuple[Optional[float], bool]:
         """
         Returns (gas_price_gwei, is_live_rpc).
+        Fail-Closed: Trả về None nếu RPC lỗi.
         """
         chain_clean = chain.lower().strip()
         if "solana" in chain_clean:
@@ -105,9 +107,9 @@ class MultiChainRPCClient:
             gwei = wei / 1e9
             return round(gwei, 4), True
         except Exception as e:
-            logger.debug(f"RPC get_gas_price fallback for {chain}: {e}")
-            # Realistic default for L2 Base / Arbitrum
-            return 0.02, False
+            logger.warning(f"RPC get_gas_price error for {chain}: {e}")
+            return None, False
+
 
     def estimate_tx_cost_usd(
         self,

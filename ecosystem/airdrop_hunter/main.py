@@ -124,18 +124,20 @@ def run_daemon_loop():
     db, radar, persona_engine, _, executor = get_farming_components()
     harvester = RewardHarvester(db=db)
 
-    # Seed initial wallets if empty
+    # Seed initial wallets from real EVM_PRIVATE_KEY if empty
     stored_wallets = db.list_wallets()
     if not stored_wallets:
-        init_wallets = [
-            "0x46babd83588f736cdfad09197e6ba4b40b132728",
-            "0x71c6bf00a49be0834277b0292bfef32342ef0123",
-            "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260456",
-        ]
-        for w in init_wallets:
-            p = persona_engine.generate_persona_for_wallet(w)
-            db.upsert_wallet(w, chain_type="EVM", persona_id=p["archetype_id"], persona_details=p)
-        print(f"[*] Đã khởi tạo {len(init_wallets)} ví cày mẫu ban đầu.")
+        pk = os.getenv("EVM_PRIVATE_KEY", "").strip()
+        if pk:
+            try:
+                from eth_account import Account
+                real_addr = Account.from_key(pk).address
+                p = persona_engine.generate_persona_for_wallet(real_addr)
+                db.upsert_wallet(real_addr, chain_type="EVM", persona_id=p["archetype_id"], persona_details=p)
+                print(f"[*] Khởi tạo ví cày tự động từ EVM_PRIVATE_KEY: {real_addr}")
+            except Exception as e:
+                print(f"[!] Không thể nhận diện ví từ EVM_PRIVATE_KEY: {e}")
+
 
     try:
         cycle_count = 0
