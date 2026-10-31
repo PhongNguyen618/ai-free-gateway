@@ -15,6 +15,7 @@ from src.agent_sdk import AgentHubNode
 from src.anti_sybil.persona_engine import PersonaEngine
 from src.config import DB_PATH, FARMING_MODE, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
 from src.executor.farming_executor import FarmingExecutor
+from src.executor.onchain_signer import BaseWethSigner, DefiYieldScanner
 from src.executor.reward_harvester import RewardHarvester
 from src.executor.rpc_client import MultiChainRPCClient
 from src.radar.airdrop_radar import AirdropRadar
@@ -278,6 +279,42 @@ def build_hub_node(
             "active_hours": p["active_hours"],
             "initial_balance": bal,
             "total_wallets": len(db.list_wallets()),
+        }
+
+    weth_signer = BaseWethSigner()
+    yield_scanner = DefiYieldScanner()
+
+    # Tool 8: Giao dịch Canonical WETH trên Base L2 (0% Phí Sàn, 0% Trượt giá, Tăng Nonce & Active Days Thật)
+    @node.tool(
+        name="execute_weth_real_cycle",
+        description="Thực hiện Wrap/Unwrap ETH sang WETH trên Base L2 (0% phí sàn, 0% trượt giá, chỉ tốn ~0.0003$ gas), tạo hash giao dịch BaseScan thật để cày Airdrop an toàn 100% vốn gốc."
+    )
+    def tool_execute_weth_real_cycle(
+        wallet_address: str = "0x46babd83588f736cdfad09197e6ba4b40b132728",
+        action: str = "wrap",
+        amount_eth: float = 0.0001,
+        max_gas_gwei: float = 0.05,
+    ) -> Dict[str, Any]:
+        return weth_signer.execute_weth_cycle(
+            wallet_address=wallet_address,
+            action=action,
+            amount_eth=float(amount_eth),
+            max_gas_gwei=float(max_gas_gwei),
+        )
+
+    # Tool 9: Quét Lãi Suất DeFi Thật trên Base L2 (DefiLlama Yields API)
+    @node.tool(
+        name="scan_base_defi_yields",
+        description="Quét lãi suất APY và thanh khoản TVL thực tế từ DefiLlama cho các bể tiết kiệm an toàn trên Base L2 (Aave V3, Moonwell, Morpho, Aerodrome)."
+    )
+    def tool_scan_base_defi_yields(limit: int = 5) -> Dict[str, Any]:
+        pools = yield_scanner.scan_base_yield_pools(limit=int(limit))
+        return {
+            "status": "SUCCESS",
+            "network": "Base L2",
+            "source": "DefiLlama Yields API",
+            "pools_count": len(pools),
+            "pools": pools,
         }
 
     return node

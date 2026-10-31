@@ -18,6 +18,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from core.agent_sdk import AgentHubNode
+from live_scanner import LiveMarketScanner
+from position_manager import TieredPositionManager
 
 logger = logging.getLogger("smart_money.hub_bridge")
 
@@ -32,6 +34,9 @@ hub_node = AgentHubNode(
     base_url=HUB_URL,
     api_key=GATEWAY_KEY,
 )
+
+position_manager = TieredPositionManager(hub_node=hub_node)
+market_scanner = LiveMarketScanner()
 
 
 _total_airdrop_capital: float = 0.0
@@ -162,6 +167,143 @@ def get_recent_signals(limit: int = 5) -> List[Dict[str, Any]]:
             "time_ago": "3m ago",
         }
     ]
+
+
+@hub_node.tool(
+    name="scan_live_meme_gems",
+    description="Quét các đồng Meme/Token dòng tiền nóng từ DexScreener + kiểm tra an toàn hợp đồng thật với GoPlus Security API"
+)
+def tool_scan_live_meme_gems(chain: str = "base", limit: int = 5) -> Dict[str, Any]:
+    """Scans verified high-liquidity gems on Base or Solana."""
+    gems = market_scanner.get_safe_trending_gems(chain=chain, limit=int(limit))
+    return {
+        "status": "SUCCESS",
+        "chain": chain,
+        "scanned_count": len(gems),
+        "gems": gems,
+        "audit_source": "DexScreener Live API + GoPlus Security Engine",
+    }
+
+
+@hub_node.tool(
+    name="open_tiered_position",
+    description="Mở vị thế mua Meme với kế hoạch Chốt Lời Bậc Thang (TP1 +40%, TP2 X2 Free-ride, TP3 X4, Moonbag 20% gồng x50)"
+)
+def tool_open_tiered_position(
+    token_address: str,
+    token_symbol: str,
+    invested_usd: float = 10.0,
+    entry_price_usd: float = 0.0,
+    chain: str = "base",
+) -> Dict[str, Any]:
+    """Opens a position with 4-tier scaling-out and moonbag trailing stop."""
+    p_usd = float(entry_price_usd)
+    if p_usd <= 0:
+        # Fetch current live price from DexScreener if not supplied
+        scanned = market_scanner.scan_dexscreener_trending(chain=chain, limit=20)
+        for s in scanned:
+            if s.get("token_address", "").lower() == token_address.strip().lower():
+                p_usd = s.get("price_usd", 0.0)
+                break
+        if p_usd <= 0:
+            p_usd = 0.05  # Fallback reference entry
+
+    pos = position_manager.open_position(
+        token_address=token_address,
+        token_symbol=token_symbol,
+        chain=chain,
+        entry_price_usd=p_usd,
+        invested_usd=float(invested_usd),
+    )
+    return {
+        "status": "OPENED",
+        "position_id": pos.position_id,
+        "token": pos.token_symbol,
+        "entry_price": pos.entry_price_usd,
+        "invested_usd": pos.invested_usd,
+        "hard_stop_loss": pos.stop_loss_price_usd,
+        "targets": {
+            "TP1 (+40%)": f"${pos.entry_price_usd * 1.4:.6f} (Bán 35% -> Dời SL về Hòa Vốn)",
+            "TP2 (X2 Free-Ride)": f"${pos.entry_price_usd * 2.0:.6f} (Bán 30% -> Rút 109% gốc + lãi)",
+            "TP3 (X4 Thu Hoạch)": f"${pos.entry_price_usd * 4.0:.6f} (Bán 15% -> Trailing Stop -35% đỉnh)",
+            "Moonbag (x10 -> x50+)": f"${pos.entry_price_usd * 10.0:.6f} -> ${pos.entry_price_usd * 50.0:.6f} (Giữ 20% gồng tối đa)",
+        },
+    }
+
+
+@hub_node.tool(
+    name="check_positions_and_tp",
+    description="Quét giá DexScreener thời gian thực cho tất cả vị thế đang mở và tự động kích hoạt chốt lời từng đoạn hoặc dời Stop-Loss"
+)
+def tool_check_positions_and_tp() -> Dict[str, Any]:
+    """Synchronizes live prices and executes scaling-out triggers."""
+    results = position_manager.sync_live_prices_from_dexscreener()
+    open_pos = position_manager.get_open_positions()
+    return {
+        "status": "SYNCED",
+        "open_positions_count": len(open_pos),
+        "updates": results,
+    }
+
+
+@hub_node.tool(
+    name="get_open_positions",
+    description="Xem danh sách tất cả các vị thế Meme đang mở, PnL %, mức nhân (Multiple), và trạng thái Moonbag"
+)
+def tool_get_open_positions() -> Dict[str, Any]:
+    """Lists current open positions and realized scaling-out metrics."""
+    positions = position_manager.get_open_positions()
+    pos_data = []
+    total_invested = sum(p.invested_usd for p in positions)
+    total_realized = sum(p.realized_usd for p in positions)
+    total_unrealized = sum(p.unrealized_value_usd for p in positions)
+
+    for p in positions:
+        pos_data.append({
+            "position_id": p.position_id,
+            "symbol": p.token_symbol,
+            "chain": p.chain,
+            "entry_price": p.entry_price_usd,
+            "current_price": p.current_price_usd,
+            "highest_price": p.highest_price_usd,
+            "multiple": f"{p.current_multiple:.2f}x",
+            "pnl_pct": f"{p.current_pnl_pct:+.1f}%",
+            "invested_usd": p.invested_usd,
+            "realized_usd": p.realized_usd,
+            "unrealized_usd": round(p.unrealized_value_usd, 2),
+            "remaining_pct": f"{p.remaining_pct*100:.0f}%",
+            "stop_loss": p.stop_loss_price_usd,
+            "status": p.status,
+            "tp_status": f"TP1: {'✅' if p.tp1_hit else '⏳'} | TP2: {'✅' if p.tp2_hit else '⏳'} | TP3: {'✅' if p.tp3_hit else '⏳'} | Moonbag: {'🌙' if p.status == 'MOONBAG' else '⏳'}",
+            "latest_event": p.events_log[-1] if p.events_log else "Chờ cập nhật",
+        })
+
+    return {
+        "total_open_positions": len(positions),
+        "total_invested_usd": round(total_invested, 2),
+        "total_realized_cash_usd": round(total_realized, 2),
+        "total_unrealized_holdings_usd": round(total_unrealized, 2),
+        "positions": pos_data,
+    }
+
+
+@hub_node.tool(
+    name="close_position_manual",
+    description="Đóng thủ công một vị thế Meme và thanh lý toàn bộ số token còn lại"
+)
+def tool_close_position_manual(position_id: str, reason: str = "MANUAL_PROFIT_TAKE") -> Dict[str, Any]:
+    """Manually liquidates remaining tokens of a position."""
+    pos = position_manager.close_position_manual(position_id, reason=reason)
+    if not pos:
+        return {"status": "NOT_FOUND", "message": f"Không tìm thấy vị thế: {position_id}"}
+    return {
+        "status": "CLOSED",
+        "position_id": pos.position_id,
+        "symbol": pos.token_symbol,
+        "total_realized_usd": pos.realized_usd,
+        "net_profit_usd": pos.total_return_usd,
+        "reason": reason,
+    }
 
 
 @hub_node.on_event("news.hot_token")

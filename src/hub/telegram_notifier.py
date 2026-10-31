@@ -125,6 +125,45 @@ class TelegramHubNotifier:
                 "🔥 <i>Bot Smart Money đã tăng quy mô lệnh để săn meme token!</i>"
             )
 
+        elif topic == "smart_money.position_opened":
+            msg = (
+                "🎯 <b>[Smart Money] ĐÃ MỞ VỊ THẾ MUA MEME MỚI!</b>\n\n"
+                f"• Token: <b>${payload.get('symbol', 'TOKEN')}</b> ({payload.get('chain', 'Base').upper()})\n"
+                f"• Vốn vào: <b>${payload.get('invested_usd', 0):.2f} USD</b>\n"
+                f"• Giá vào: <code>${payload.get('entry_price', 0):.6f}</code>\n"
+                f"• Stop-Loss cứng: <code>${payload.get('stop_loss', 0):.6f}</code> (-18%)\n\n"
+                "<i>Kế hoạch: Bán 35% ở +40% -> Rút gốc ở x2 -> Giữ 20% Moonbag x50!</i>"
+            )
+
+        elif topic == "smart_money.partial_tp_hit":
+            tier = payload.get("tier", "TP")
+            msg = (
+                f"🎉 <b>[Smart Money] CHỐT LỜI TỪNG ĐOẠN: {tier}!</b>\n\n"
+                f"• Token: <b>${payload.get('symbol', 'TOKEN')}</b>\n"
+                f"• Tiền thu về ví: <b>+${payload.get('sold_usd', 0):.2f} USD</b>\n"
+                f"• Stop-Loss mới: <code>${payload.get('new_stop_loss', 0):.6f}</code> (Đã dời dương/hòa vốn)\n\n"
+                "<i>Lợi nhuận đã khóa thành tiền mặt, tiếp tục giữ các mốc cao hơn!</i>"
+            )
+
+        elif topic == "smart_money.moonbag_active":
+            mult = payload.get("multiple", "MOONBAG")
+            msg = (
+                f"🌙 <b>[Smart Money] SIÊU SÓNG MOONBAG {mult} ĐÃ ĐẠT!</b>\n\n"
+                f"• Token: <b>${payload.get('symbol', 'TOKEN')}</b>\n"
+                f"• Tiền chốt đợt này: <b>+${payload.get('sold_usd', 0):.2f} USD</b>\n"
+                f"• Tổng lãi ròng: <b>+${payload.get('total_return_usd', 0):.2f} USD</b>\n\n"
+                "🚀 <i>Moonbag x50 mang lại lợi nhuận bùng nổ cho tài khoản!</i>"
+            )
+
+        elif topic == "smart_money.stop_loss_hit":
+            msg = (
+                "🛑 <b>[Smart Money] Đã Kích Hoạt Stop-Loss Bảo Vệ Vốn!</b>\n\n"
+                f"• Token: <b>${payload.get('symbol', 'TOKEN')}</b>\n"
+                f"• Tiền thu hồi: <b>${payload.get('final_realized_usd', 0):.2f} USD</b>\n"
+                f"• PnL lệnh: <b>${payload.get('total_return_usd', 0):.2f} USD</b>\n\n"
+                "<i>Bảo vệ an toàn vốn gốc để sẵn sàng cho các cơ hội tiếp theo.</i>"
+            )
+
         elif "smart_money" in topic or "signal" in topic or topic == "news.hot_token":
             token = payload.get("token") or payload.get("symbol") or "Hot Token"
             msg = (

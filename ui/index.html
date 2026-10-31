@@ -364,6 +364,58 @@
         </div>
       </div>
 
+      <!-- Section 2.5: Tiered Scaling-Out & Moonbag x50 Position Manager -->
+      <div class="card" style="border: 1px solid rgba(245, 158, 11, 0.35);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fbbf24; display: flex; align-items: center; gap: 0.5rem;">
+              🚀 Quản Lý Vị Thế Meme & Thang Chốt Lời Moonbag x50
+              <span class="badge badge-amber">Quant Scaling-Out</span>
+            </h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">
+              Tự động hóa 4 giai đoạn: Bán 35% ở +40% ➔ Rút 109% vốn ở x2 (Free Ride) ➔ Bán 15% ở x4 ➔ Giữ 20% Moonbag gồng x10 đến x50+!
+            </p>
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+            <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="scanLiveMemeGems()">🔍 Quét DexScreener + GoPlus</button>
+            <button class="btn btn-emerald" style="font-size: 0.6875rem;" onclick="syncMemePositions()">🔄 Quét Giá & Chốt Lời Tự Động</button>
+          </div>
+        </div>
+
+        <!-- Form Mở Vị Thế Nhanh -->
+        <div style="background: rgba(2, 6, 23, 0.6); border: 1px solid #1e293b; border-radius: 0.5rem; padding: 0.75rem; margin-bottom: 1rem; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+          <input type="text" id="meme-new-token-addr" class="input-text font-mono" style="margin: 0; flex: 2; min-width: 180px; font-size: 0.75rem; padding: 0.35rem 0.6rem;" placeholder="Địa chỉ Token (0x... hoặc Sol address)">
+          <input type="text" id="meme-new-token-symbol" class="input-text font-mono" style="margin: 0; width: 100px; font-size: 0.75rem; padding: 0.35rem 0.6rem;" placeholder="Symbol (BRETT...)">
+          <input type="number" id="meme-new-token-invested" class="input-text font-mono" style="margin: 0; width: 90px; font-size: 0.75rem; padding: 0.35rem 0.6rem;" value="10" placeholder="Vốn USD">
+          <select id="meme-new-token-chain" class="input-text" style="margin: 0; width: auto; font-size: 0.75rem; padding: 0.35rem 0.6rem; background: #1e293b; color: #e2e8f0; border: 1px solid #334155;">
+            <option value="base">Base L2</option>
+            <option value="solana">Solana</option>
+          </select>
+          <button class="btn btn-emerald" onclick="openNewPosition()">➕ Mở Vị Thế Moonbag</button>
+        </div>
+
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Mạng</th>
+                <th>Giá Vào (Entry)</th>
+                <th>Giá Live</th>
+                <th>Mức Nhân & Lãi</th>
+                <th>Vốn / Đã Rút Tiền Mặt</th>
+                <th>Thang Chốt Lời (TP1 / TP2 / TP3 / Moonbag)</th>
+                <th>Stop-Loss Bảo Vệ</th>
+                <th>Thao Tác</th>
+              </tr>
+            </thead>
+            <tbody id="hub-positions-table-body">
+              <tr><td colspan="9" style="text-align: center; color: #64748b; padding: 1.5rem;">Đang tải danh sách vị thế Meme...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Section 3: Connected Projects & 1-Click Interactive Tools -->
       <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
@@ -1316,6 +1368,7 @@
         fetchHubData();
         checkTelegramStatus();
         refreshWalletBalances();
+        fetchMemePositions();
       }
     }
 
@@ -1953,6 +2006,231 @@
           }
         } else {
           showToast('Lỗi gọi API thêm ví', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
+    async function fetchMemePositions() {
+      const tbody = document.getElementById('hub-positions-table-body');
+      if (!tbody) return;
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'smart-money-agent',
+            tool_name: 'get_open_positions',
+            arguments: {},
+            timeout: 15.0,
+          }),
+        });
+
+        if (!resp || !resp.ok) return;
+        const data = await resp.json();
+        if (data.status !== 'success' || !data.result) return;
+
+        const positions = data.result.positions || [];
+        tbody.textContent = '';
+
+        if (positions.length === 0) {
+          const tr = document.createElement('tr');
+          const td = createEl('td', '', 'Chưa có vị thế Meme nào mở. Dùng form trên hoặc nút "Quét DexScreener" để mở vị thế gồng Moonbag x50.');
+          td.colSpan = 9;
+          td.style.textAlign = 'center';
+          td.style.color = '#64748b';
+          td.style.padding = '1.5rem';
+          tr.appendChild(td);
+          tbody.appendChild(tr);
+          return;
+        }
+
+        positions.forEach(p => {
+          const tr = document.createElement('tr');
+
+          // 1. Token
+          const tdTok = document.createElement('td');
+          const symSpan = createEl('strong', '', p.symbol || 'MEME');
+          symSpan.style.color = '#fbbf24';
+          symSpan.style.marginRight = '0.35rem';
+          const addrSmall = createEl('span', 'font-mono truncate', (p.position_id || '').slice(0, 10));
+          addrSmall.style.fontSize = '0.6875rem';
+          addrSmall.style.color = '#64748b';
+          tdTok.appendChild(symSpan);
+          tdTok.appendChild(addrSmall);
+          tr.appendChild(tdTok);
+
+          // 2. Chain
+          const tdChain = document.createElement('td');
+          const cBadge = createEl('span', 'badge badge-slate', (p.chain || 'base').toUpperCase());
+          tdChain.appendChild(cBadge);
+          tr.appendChild(tdChain);
+
+          // 3. Entry Price
+          const tdEntry = createEl('td', 'font-mono', `$${Number(p.entry_price || 0).toFixed(6)}`);
+          tdEntry.style.fontSize = '0.75rem';
+          tr.appendChild(tdEntry);
+
+          // 4. Live Price
+          const tdLive = createEl('td', 'font-mono', `$${Number(p.current_price || 0).toFixed(6)}`);
+          tdLive.style.fontSize = '0.75rem';
+          tdLive.style.fontWeight = '700';
+          tr.appendChild(tdLive);
+
+          // 5. Multiple & PnL
+          const tdPnl = document.createElement('td');
+          const pnlSpan = createEl('span', '', `${p.multiple} (${p.pnl_pct})`);
+          pnlSpan.className = p.pnl_pct.startsWith('+') ? 'badge badge-emerald' : 'badge badge-rose';
+          tdPnl.appendChild(pnlSpan);
+          tr.appendChild(tdPnl);
+
+          // 6. Invested / Realized Cash
+          const tdCash = document.createElement('td');
+          tdCash.className = 'font-mono';
+          tdCash.style.fontSize = '0.75rem';
+          const invTxt = `$${Number(p.invested_usd || 0).toFixed(2)}`;
+          const realTxt = ` / +$${Number(p.realized_usd || 0).toFixed(2)} rút`;
+          const invSpan = createEl('span', '', invTxt);
+          invSpan.style.color = '#cbd5e1';
+          const realSpan = createEl('span', '', realTxt);
+          realSpan.style.color = p.realized_usd >= p.invested_usd ? '#34d399' : '#fbbf24';
+          realSpan.style.fontWeight = '700';
+          tdCash.appendChild(invSpan);
+          tdCash.appendChild(realSpan);
+          tr.appendChild(tdCash);
+
+          // 7. TP Status
+          const tdTp = createEl('td', 'font-mono', p.tp_status || '--');
+          tdTp.style.fontSize = '0.6875rem';
+          tdTp.style.color = '#38bdf8';
+          tr.appendChild(tdTp);
+
+          // 8. Stop-Loss
+          const tdSl = createEl('td', 'font-mono', `$${Number(p.stop_loss || 0).toFixed(6)}`);
+          tdSl.style.fontSize = '0.75rem';
+          tdSl.style.color = '#fb7185';
+          tr.appendChild(tdSl);
+
+          // 9. Actions
+          const tdAct = document.createElement('td');
+          const closeBtn = createEl('button', 'btn btn-rose', 'Chốt / Thoát');
+          closeBtn.style.fontSize = '0.6875rem';
+          closeBtn.style.padding = '0.2rem 0.5rem';
+          closeBtn.onclick = () => closePosition(p.position_id);
+          tdAct.appendChild(closeBtn);
+          tr.appendChild(tdAct);
+
+          tbody.appendChild(tr);
+        });
+      } catch (err) {
+        console.error('fetchMemePositions error:', err);
+      }
+    }
+
+    async function syncMemePositions() {
+      showToast('Đang quét giá DexScreener và kích hoạt chốt lời từng đoạn...');
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'smart-money-agent',
+            tool_name: 'check_positions_and_tp',
+            arguments: {},
+          }),
+        });
+
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data.status === 'success') {
+            const count = (data.result.updates || []).length;
+            showToast(`Đã đồng bộ giá ${count} vị thế!`);
+            fetchMemePositions();
+          } else {
+            showToast('Lỗi đồng bộ giá vị thế', true);
+          }
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
+    async function scanLiveMemeGems() {
+      showToast('Đang quét DexScreener & kiểm tra bảo mật GoPlus...');
+      executeToolDirectly('smart-money-agent', 'scan_live_meme_gems', { chain: 'base', limit: 5 });
+    }
+
+    async function openNewPosition() {
+      const addrEl = document.getElementById('meme-new-token-addr');
+      const symEl = document.getElementById('meme-new-token-symbol');
+      const invEl = document.getElementById('meme-new-token-invested');
+      const chainEl = document.getElementById('meme-new-token-chain');
+
+      const addr = (addrEl ? addrEl.value : '').trim();
+      const sym = (symEl ? symEl.value : '').trim() || 'MEME';
+      const inv = parseFloat(invEl ? invEl.value : '10') || 10.0;
+      const chain = (chainEl ? chainEl.value : 'base').trim();
+
+      if (!addr || addr.length < 8) {
+        showToast('Vui lòng nhập địa chỉ Token hợp lệ!', true);
+        return;
+      }
+
+      showToast(`Đang mở vị thế ${sym} $${inv} trên ${chain.toUpperCase()}...`);
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'smart-money-agent',
+            tool_name: 'open_tiered_position',
+            arguments: {
+              token_address: addr,
+              token_symbol: sym,
+              invested_usd: inv,
+              chain: chain,
+            },
+          }),
+        });
+
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data.status === 'success') {
+            showToast(`Đã mở vị thế ${sym}! Stop-loss và kế hoạch Moonbag x50 đã thiết lập.`);
+            if (addrEl) addrEl.value = '';
+            if (symEl) symEl.value = '';
+            fetchMemePositions();
+          } else {
+            showToast(data.message || 'Lỗi mở vị thế', true);
+          }
+        } else {
+          showToast('Lỗi gọi API mở vị thế', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
+    async function closePosition(posId) {
+      if (!confirm(`Bạn có chắc chắn muốn chốt / đóng vị thế ${posId} này không?`)) return;
+      showToast(`Đang đóng vị thế ${posId}...`);
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'smart-money-agent',
+            tool_name: 'close_position_manual',
+            arguments: { position_id: posId, reason: 'USER_MANUAL_TAKE_PROFIT' },
+          }),
+        });
+
+        if (resp && resp.ok) {
+          showToast('Đã đóng vị thế thành công!');
+          fetchMemePositions();
+        } else {
+          showToast('Lỗi đóng vị thế', true);
         }
       } catch (err) {
         showToast('Lỗi kết nối: ' + err.message, true);
