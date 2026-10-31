@@ -128,6 +128,7 @@ def run_daemon_loop():
     stored_wallets = db.list_wallets()
     if not stored_wallets:
         init_wallets = [
+            "0x46babd83588f736cdfad09197e6ba4b40b132728",
             "0x71c6bf00a49be0834277b0292bfef32342ef0123",
             "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260456",
         ]

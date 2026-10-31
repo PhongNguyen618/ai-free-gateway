@@ -73,6 +73,11 @@ class HubCallToolRequest(BaseModel):
     timeout: Optional[float] = 30.0
 
 
+class HubTelegramConfigRequest(BaseModel):
+    bot_token: str
+    chat_id: str
+
+
 def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     """
     Application Factory for AI Free Gateway.
@@ -633,6 +638,16 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         return {
             "is_configured": telegram_notifier.is_configured,
             "chat_id_configured": bool(telegram_notifier.chat_id),
+        }
+
+    @app.post("/api/hub/telegram/config", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_telegram_config(payload: HubTelegramConfigRequest) -> Dict[str, Any]:
+        """Cập nhật cấu hình Telegram Bot Token và Chat ID trực tiếp lúc chạy."""
+        telegram_notifier.bot_token = payload.bot_token.strip().strip('"').strip("'")
+        telegram_notifier.chat_id = payload.chat_id.strip().strip('"').strip("'")
+        return {
+            "status": "CONFIGURED" if telegram_notifier.is_configured else "INVALID",
+            "is_configured": telegram_notifier.is_configured,
         }
 
     # --- Mount OpenAI Compatible Proxy Router ---

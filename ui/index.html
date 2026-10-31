@@ -1836,9 +1836,11 @@
             const wEl = document.getElementById('hub-kpi-wallets');
             if (wEl) wEl.textContent = `${r.total_wallets || 0} ví`;
             const pEl = document.getElementById('hub-kpi-points');
-            if (pEl) pEl.textContent = `${(r.total_points_accumulated || 0).toLocaleString()} pts`;
+            const pts = r.total_farming_points ?? r.total_points_accumulated ?? 0;
+            if (pEl) pEl.textContent = `${Number(pts).toLocaleString()} pts`;
             const cEl = document.getElementById('hub-kpi-capital');
-            if (cEl) cEl.textContent = `$${(r.total_capital_routed_usd || 0).toFixed(2)}`;
+            const cap = r.total_routed_to_meme_usd ?? r.total_capital_routed_usd ?? 0;
+            if (cEl) cEl.textContent = `$${Number(cap).toFixed(2)}`;
           }
         }
 
