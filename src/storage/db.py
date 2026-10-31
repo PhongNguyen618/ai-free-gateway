@@ -114,11 +114,27 @@ async def init_db(db_path: str) -> None:
             )
         """)
 
+        # Table 5: hub_events (S04: Persistent Shared Event Bus)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hub_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                topic TEXT NOT NULL,
+                source_project TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                timestamp REAL NOT NULL
+            )
+        """)
+
         # Indexes for fast filtering
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_models_provider ON models_pool(provider)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_models_active ON models_pool(is_active)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_dlp_timestamp ON dlp_audit_logs(timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON pending_approvals(status)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_hub_events_seq ON hub_events(sequence)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_hub_events_topic ON hub_events(topic)")
 
         await conn.commit()
 
@@ -574,3 +590,52 @@ async def get_dashboard_stats(db_path: str) -> Dict[str, Any]:
             "pending_approvals_count": pending_count,
             "dlp_incidents_count": dlp_incidents,
         }
+
+
+# --- S04: Persistent Shared Event Bus Operations ---
+
+async def save_hub_event(db_path: str, event: Dict[str, Any]) -> None:
+    """Persists an event from the Shared Event Bus to SQLite."""
+    async with get_db(db_path) as conn:
+        payload_str = json.dumps(event.get("payload", {}), ensure_ascii=False)
+        await conn.execute("""
+            INSERT INTO hub_events (event_id, sequence, topic, source_project, payload_json, priority, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(event.get("event_id", "")),
+            int(event.get("sequence", 0)),
+            str(event.get("topic", "")),
+            str(event.get("source_project", "")),
+            payload_str,
+            str(event.get("priority", "normal")),
+            float(event.get("timestamp", 0.0)),
+        ))
+        await conn.commit()
+
+
+async def load_recent_hub_events(db_path: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Loads recent hub events from SQLite in chronological order on startup."""
+    async with get_db(db_path) as conn:
+        cursor = await conn.execute("""
+            SELECT event_id, sequence, topic, source_project, payload_json, priority, timestamp
+            FROM hub_events
+            ORDER BY sequence DESC
+            LIMIT ?
+        """, (max(1, int(limit)),))
+        rows = await cursor.fetchall()
+        events = []
+        for r in reversed(rows):
+            try:
+                p = json.loads(r["payload_json"])
+            except Exception:
+                p = {}
+            events.append({
+                "event_id": r["event_id"],
+                "sequence": r["sequence"],
+                "topic": r["topic"],
+                "source_project": r["source_project"],
+                "payload": p,
+                "priority": r["priority"],
+                "timestamp": r["timestamp"],
+            })
+        return events

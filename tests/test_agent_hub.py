@@ -304,3 +304,123 @@ def test_agent_hub_node_decorators_and_manual_cycle():
     func, meta = node._tools["scrape_url"]
     assert meta["description"] == "Scrapes articles from target URL"
     assert func("http://example.com") == "Scraped content from http://example.com"
+
+
+# ============================================================================
+# S01 - S04: Hardening & Multi-Step Integration Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_agent_hub_auth_protection(tmp_path):
+    """S01: Verify /api/hub/* endpoints strictly enforce gateway_api_key authentication."""
+    test_db = str(tmp_path / "test_hub_auth.db")
+    config = get_config()
+    config.db_path = test_db
+    config.server.gateway_api_key = "test-secret-key-123"
+
+    await storage_db.init_db(test_db)
+    app = create_app(config)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Request without key must be 401 Unauthorized
+        r_unauth = await client.get("/api/hub/projects")
+        assert r_unauth.status_code == 401
+
+        # Request with invalid key must be 401
+        r_invalid = await client.get("/api/hub/projects", headers={"Authorization": "Bearer wrong-key"})
+        assert r_invalid.status_code == 401
+
+        # Request with valid key must be 200 OK
+        r_valid = await client.get("/api/hub/projects", headers={"Authorization": "Bearer test-secret-key-123"})
+        assert r_valid.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_ai_orchestrator_multi_step_chaining_and_loop_guard():
+    """S03: Verify multi-step tool chaining across projects and loop detection."""
+    reg = ProjectRegistry()
+    bus = SharedEventBus()
+
+    reg.register_project("scraper", tools=[{"name": "get_hot_coin"}])
+    reg.register_project("auditor", tools=[{"name": "audit_coin"}])
+
+    step_counter = 0
+
+    async def mock_multi_step_ai(messages: List[Dict[str, str]], model_tier: str) -> str:
+        nonlocal step_counter
+        step_counter += 1
+        if step_counter == 1:
+            # Step 1: Call scraper
+            return json.dumps({
+                "action": "call_tool",
+                "project_id": "scraper",
+                "tool_name": "get_hot_coin",
+                "arguments": {},
+            })
+        elif step_counter == 2:
+            # Step 2: Call auditor with scraped token
+            return json.dumps({
+                "action": "call_tool",
+                "project_id": "auditor",
+                "tool_name": "audit_coin",
+                "arguments": {"token": "SOL"},
+            })
+        else:
+            # Step 3: Finish with synthesized answer
+            return json.dumps({
+                "action": "finish",
+                "answer": "Đồng SOL là coin hot và được đánh giá an toàn 95/100.",
+            })
+
+    orchestrator = AIAutoOrchestrator(registry=reg, event_bus=bus, chat_fn=mock_multi_step_ai)
+
+    # Background worker satisfying commands for both projects
+    async def node_worker():
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            c1 = reg.heartbeat("scraper")
+            for c in c1:
+                reg.submit_command_result(c["command_id"], "scraper", "success", "SOL")
+            c2 = reg.heartbeat("auditor")
+            for c in c2:
+                reg.submit_command_result(c["command_id"], "auditor", "success", {"safety_score": 95})
+
+    w_task = asyncio.create_task(node_worker())
+    res = await orchestrator.orchestrate("Tìm coin hot và chấm điểm an toàn", max_steps=4)
+    await w_task
+
+    assert res["steps_count"] == 2
+    assert len(res["steps_executed"]) == 2
+    assert "scraper:get_hot_coin" in res["steps_executed"][0]["tool"]
+    assert "auditor:audit_coin" in res["steps_executed"][1]["tool"]
+    assert "SOL" in res["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_shared_event_bus_sqlite_persistence(tmp_path):
+    """S04: Verify SharedEventBus persists events to SQLite and recovers on restart."""
+    test_db = str(tmp_path / "test_bus_persist.db")
+    await storage_db.init_db(test_db)
+
+    # Bus 1 with persistence callback
+    bus1 = SharedEventBus(persistence_callback=lambda evt: storage_db.save_hub_event(test_db, evt))
+    bus1.publish("market.signal", "bot-1", {"signal": "BUY", "price": 100})
+    bus1.publish("market.alert", "bot-2", {"alert": "HIGH_VOLATILITY"})
+
+    await asyncio.sleep(0.1)
+
+    # Read events directly from SQLite
+    persisted = await storage_db.load_recent_hub_events(test_db, limit=10)
+    assert len(persisted) == 2
+    assert persisted[0]["topic"] == "market.signal"
+    assert persisted[1]["topic"] == "market.alert"
+
+    # Bus 2 recovering state on restart
+    bus2 = SharedEventBus()
+    bus2.init_from_history(persisted)
+    assert bus2._event_counter == 2
+    history = bus2.get_history()
+    assert len(history) == 2
+    assert history[0]["source_project"] == "bot-1"
+

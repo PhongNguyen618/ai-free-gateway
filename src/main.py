@@ -96,25 +96,53 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     response_cache = ResponseCache()
     project_quota_guard = ProjectQuotaGuard()
     project_registry = ProjectRegistry()
-    shared_event_bus = SharedEventBus()
+    shared_event_bus = SharedEventBus(
+        persistence_callback=lambda evt: storage_db.save_hub_event(config.db_path, evt)
+    )
 
     async def internal_ai_chat(messages: List[Dict[str, str]], model_tier: str = "reasoning") -> str:
+        # S02: 1. Deterministic Cache Check
+        cache_key = ResponseCache.compute_cache_key(model_tier, messages)
+        cached = response_cache.get(cache_key)
+        if cached and "content" in cached:
+            content_obj = cached["content"]
+            if isinstance(content_obj, dict) and "choices" in content_obj:
+                return content_obj["choices"][0]["message"]["content"]
+            elif isinstance(content_obj, str):
+                return content_obj
+
+        # S02: 2. Fallback candidate chain loop
         candidates = await balancer.get_candidate_chain(model_tier)
         if not candidates:
             raise RuntimeError("No available AI model candidate in current catalog.")
-        candidate = candidates[0]
-        target_url = candidate["endpoint_url"]
-        provider_name = candidate["provider"]
-        api_key = get_provider_api_key(provider_name, config)
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": candidate["model_name"],
-            "messages": messages,
-            "temperature": 0.2,
-        }
-        resp = await egress_guard.post(target_url, headers=headers, json_data=payload)
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
+            target_url = candidate["endpoint_url"]
+            provider_name = candidate["provider"]
+            api_key = get_provider_api_key(provider_name, config)
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": candidate["model_name"],
+                "messages": messages,
+                "temperature": 0.2,
+            }
+            try:
+                resp = await egress_guard.post(target_url, headers=headers, json_data=payload)
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Provider {provider_name} returned HTTP {resp.status_code}: {resp.text[:150]}")
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                # Save into response cache
+                response_cache.set(cache_key, content, ttl_seconds=180.0)
+                return content
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Internal AI candidate {candidate.get('id')} failed: {exc}. Trying fallback...")
+                await balancer.record_error(candidate.get("id", ""))
+                continue
+
+        raise RuntimeError(f"All AI candidates for tier '{model_tier}' failed. Last error: {last_error}")
 
     orchestrator = AIAutoOrchestrator(
         registry=project_registry,
@@ -139,6 +167,13 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             cleaned = await storage_db.cleanup_orphan_pending(config.db_path)
             if cleaned > 0:
                 logger.info(f"Cleaned up {cleaned} orphan pending approvals from previous session.")
+
+            # S04: Load persisted hub events into SharedEventBus
+            try:
+                past_events = await storage_db.load_recent_hub_events(config.db_path, limit=100)
+                shared_event_bus.init_from_history(past_events)
+            except Exception as e_ev:
+                logger.warning(f"Could not load historical hub events: {e_ev}")
 
             logger.info("Performing initial model harvesting and provider registration...")
             try:
@@ -483,9 +518,9 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         """Thống kê Hits, Misses, Hit Ratio và Số lượng entry trong Response Cache."""
         return response_cache.get_stats()
 
-    # --- Agent Hub (All-in-One) Endpoints ---
+    # --- Agent Hub (All-in-One) Endpoints (S01: Protected by verify_auth) ---
 
-    @app.post("/api/hub/register", tags=["Agent Hub"])
+    @app.post("/api/hub/register", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_register(payload: HubRegisterRequest) -> Dict[str, Any]:
         """Đăng ký dự án và công cụ MCP-Lite kết nối vào Hub."""
         return project_registry.register_project(
@@ -495,13 +530,13 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             tools=payload.tools,
         )
 
-    @app.post("/api/hub/heartbeat", tags=["Agent Hub"])
+    @app.post("/api/hub/heartbeat", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_heartbeat(payload: HubHeartbeatRequest) -> Dict[str, Any]:
         """Nhận nhịp tim từ node dự án và trả về các lệnh điều phối đang chờ chạy."""
         cmds = project_registry.heartbeat(payload.project_id)
         return {"status": "ok", "commands": cmds}
 
-    @app.post("/api/hub/command/result", tags=["Agent Hub"])
+    @app.post("/api/hub/command/result", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_command_result(payload: HubCommandResultRequest) -> Dict[str, Any]:
         """Node dự án trả về kết quả sau khi thực thi lệnh công cụ."""
         success = project_registry.submit_command_result(
@@ -513,17 +548,17 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         )
         return {"status": "accepted" if success else "ignored"}
 
-    @app.get("/api/hub/projects", tags=["Agent Hub"])
+    @app.get("/api/hub/projects", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_get_projects() -> List[Dict[str, Any]]:
         """Lấy danh sách các dự án đang kết nối (Online / Offline)."""
         return project_registry.get_all_projects()
 
-    @app.get("/api/hub/tools", tags=["Agent Hub"])
+    @app.get("/api/hub/tools", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_get_tools() -> List[Dict[str, Any]]:
         """Lấy danh sách tất cả công cụ (MCP Tools) của các dự án đang online."""
         return project_registry.get_all_tools()
 
-    @app.post("/api/hub/events/publish", tags=["Agent Hub"])
+    @app.post("/api/hub/events/publish", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_publish_event(payload: HubPublishEventRequest) -> Dict[str, Any]:
         """Phát sự kiện lên Bảng Tin Chung (Shared Event Bus)."""
         return shared_event_bus.publish(
@@ -533,18 +568,18 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             priority=payload.priority or "normal",
         )
 
-    @app.get("/api/hub/events/poll", tags=["Agent Hub"])
+    @app.get("/api/hub/events/poll", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_poll_events(topic: Optional[str] = None, since_sequence: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
         """Lấy các sự kiện mới nhất từ Bảng Tin Chung."""
         topics = [topic] if topic else None
         return shared_event_bus.poll(topics=topics, since_sequence=since_sequence, limit=limit)
 
-    @app.get("/api/hub/events/history", tags=["Agent Hub"])
+    @app.get("/api/hub/events/history", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_event_history(limit: int = 100, topic: Optional[str] = None) -> List[Dict[str, Any]]:
         """Xem lịch sử các thông điệp trao đổi trên Bảng Tin Chung."""
         return shared_event_bus.get_history(limit=limit, topic=topic)
 
-    @app.post("/api/hub/orchestrate", tags=["Agent Hub"])
+    @app.post("/api/hub/orchestrate", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
     async def hub_orchestrate(payload: HubOrchestrateRequest) -> Dict[str, Any]:
         """AI Trưởng Phòng nhận câu lệnh tiếng Việt, tự động chọn công cụ dự án để điều phối."""
         return await orchestrator.orchestrate(

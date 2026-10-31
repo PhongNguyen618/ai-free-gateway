@@ -16,11 +16,25 @@ logger = logging.getLogger("ai_free_gateway.hub.event_bus")
 
 
 class SharedEventBus:
-    def __init__(self, max_history: int = 1000):
+    def __init__(
+        self,
+        max_history: int = 1000,
+        persistence_callback: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ):
         self.max_history = max(50, int(max_history))
         self._events: deque[Dict[str, Any]] = deque(maxlen=self.max_history)
         self._event_counter = 0
+        self._persistence_callback = persistence_callback
         self._subscribers: List[Callable[[Dict[str, Any]], Optional[Coroutine[Any, Any, None]]]] = []
+
+    def init_from_history(self, events_list: List[Dict[str, Any]]) -> None:
+        """Initializes in-memory event stream from persistent storage."""
+        for evt in events_list:
+            self._events.append(evt)
+            seq = int(evt.get("sequence", 0))
+            if seq > self._event_counter:
+                self._event_counter = seq
+        logger.info(f"Initialized SharedEventBus with {len(events_list)} persisted events (seq={self._event_counter}).")
 
     def publish(
         self,
@@ -45,6 +59,15 @@ class SharedEventBus:
         }
         self._events.append(event)
         logger.info(f"Published event #{self._event_counter} on topic '{clean_topic}' from '{clean_source}'")
+
+        # S04: Persist event via callback if configured
+        if self._persistence_callback:
+            try:
+                res_p = self._persistence_callback(event)
+                if asyncio.iscoroutine(res_p):
+                    asyncio.create_task(res_p)
+            except Exception as ep:
+                logger.warning(f"Error persisting event to storage: {ep}")
 
         # Notify active callbacks (non-blocking)
         for sub in list(self._subscribers):
