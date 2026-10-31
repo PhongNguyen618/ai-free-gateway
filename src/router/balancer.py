@@ -250,6 +250,35 @@ def detect_agent_loop(messages: List[Dict[str, Any]]) -> Tuple[bool, Optional[st
     return False, None
 
 
+TIER_ALIASES = {"auto", "default", "best", "free", "", "fast", "reasoning", "coding", "long_context"}
+
+
+def evaluate_tier_boost(model_name: str, context_len: int, latency_ms: float, tier: str) -> float:
+    name_lower = model_name.lower()
+    score = 0.0
+    if tier == "fast":
+        if 0 < latency_ms <= 800:
+            score += 300.0
+        if any(term in name_lower for term in ["gpt-4o-mini", "gpt-oss-20b", "27b", "8b", "flash"]):
+            score += 350.0
+        if any(term in name_lower for term in ["120b", "70b", "r1", "ultra", "550b"]):
+            score -= 400.0
+    elif tier == "reasoning":
+        if any(term in name_lower for term in ["r1", "reason", "120b", "70b", "deepseek-r1"]):
+            score += 500.0
+    elif tier == "coding":
+        if any(term in name_lower for term in ["coder", "coding", "starcoder", "deepseek", "qwen-2.5-coder", "gpt-4o", "gpt-oss-120b"]):
+            score += 500.0
+    elif tier == "long_context":
+        if context_len >= 1000000:
+            score += 600.0
+        elif context_len >= 128000:
+            score += 300.0
+        else:
+            score -= 300.0
+    return score
+
+
 class ModelBalancer:
     """
     Intelligent Model Balancer & Router.
@@ -551,10 +580,11 @@ class ModelBalancer:
         ]
 
         clean_req = requested_model.strip()
-        is_auto_mode = clean_req.lower() in ("auto", "default", "best", "free", "")
+        req_lower = clean_req.lower()
+        is_tier_mode = req_lower in TIER_ALIASES
 
         # EXPLICIT MODEL HANDLING (R2-09)
-        if not is_auto_mode:
+        if not is_tier_mode:
             # Check if model exists in pool at all (active or cooling down)
             matching_in_all = [m for m in all_models if m["id"] == clean_req or m["model_name"] == clean_req]
             if not matching_in_all:
@@ -584,7 +614,7 @@ class ModelBalancer:
             ]
             return [target_model] + fallback_models
 
-        # AUTO MODE: Filter and rank available models
+        # AUTO / TIER MODE: Filter and rank available models
         candidates: List[Dict[str, Any]] = []
         seen_canonical: Set[Tuple[str, str]] = set()
 
@@ -610,6 +640,9 @@ class ModelBalancer:
 
             context_len = m.get("context_length", 128000)
             score += self.evaluate_model_intelligence(m["model_name"], context_len, task_type)
+
+            latency = float(m.get("latency_ms", 200.0) or 200.0)
+            score += evaluate_tier_boost(m["model_name"], context_len, latency, req_lower)
 
             for rank_idx, p_id in enumerate(priority_models):
                 if m["id"] == p_id or m["model_name"] == p_id or m["id"].endswith("/" + p_id):

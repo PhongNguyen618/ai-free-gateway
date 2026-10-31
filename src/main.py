@@ -18,8 +18,10 @@ from src.discovery.harvester import ModelHarvester
 from src.lifecycle import InstanceLock, InstanceAlreadyRunningError
 from src.router.balancer import ModelBalancer
 from src.router.openai_proxy import create_openai_router, make_openai_error
+from src.router.response_cache import ResponseCache
 from src.security.approval_gate import ApprovalGate
 from src.security.egress_guard import EgressGuard
+from src.security.project_quota import ProjectQuotaGuard
 from src.storage import db as storage_db
 
 logger = logging.getLogger("ai_free_gateway")
@@ -57,6 +59,8 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     approval_gate = ApprovalGate(db_path=config.db_path)
     balancer = ModelBalancer(config=config)
     harvester = ModelHarvester(config=config, egress_guard=egress_guard)
+    response_cache = ResponseCache()
+    project_quota_guard = ProjectQuotaGuard()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -117,6 +121,8 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     app.state.approval_gate = approval_gate
     app.state.balancer = balancer
     app.state.harvester = harvester
+    app.state.response_cache = response_cache
+    app.state.project_quota_guard = project_quota_guard
     app.state.initialized = False
     app.state.catalog_usable = False
 
@@ -404,6 +410,16 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             })
         return {"providers": results}
 
+    @app.get("/api/projects/stats", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
+    async def get_project_stats() -> Dict[str, Any]:
+        """Thống kê RPM, Request Count và Vi phạm Rate Limit theo Project ID."""
+        return project_quota_guard.get_all_stats()
+
+    @app.get("/api/cache/stats", tags=["Dashboard"], dependencies=[Depends(verify_auth)])
+    async def get_cache_stats() -> Dict[str, Any]:
+        """Thống kê Hits, Misses, Hit Ratio và Số lượng entry trong Response Cache."""
+        return response_cache.get_stats()
+
     # --- Mount OpenAI Compatible Proxy Router ---
     openai_router = create_openai_router(
         config=config,
@@ -411,6 +427,8 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
         approval_gate=approval_gate,
         balancer=balancer,
         harvester=harvester,
+        response_cache=response_cache,
+        project_quota_guard=project_quota_guard,
     )
     app.include_router(openai_router)
 

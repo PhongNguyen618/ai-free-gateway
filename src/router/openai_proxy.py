@@ -25,6 +25,8 @@ from src.router.balancer import (
 from src.security.approval_gate import ApprovalGate
 from src.security.egress_guard import EgressGuard
 from src.security.sanitizer import DLPSanitizer, StreamingRestorer, UnsupportedModalityError
+from src.router.response_cache import ResponseCache
+from src.security.project_quota import ProjectQuotaGuard
 from src.storage import db as storage_db
 
 logger = logging.getLogger("ai_free_gateway.openai_proxy")
@@ -250,6 +252,8 @@ def create_openai_router(
     approval_gate: ApprovalGate,
     balancer: ModelBalancer,
     harvester: ModelHarvester,
+    response_cache: Optional[ResponseCache] = None,
+    project_quota_guard: Optional[ProjectQuotaGuard] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1", tags=["OpenAI Compatible Proxy"])
     admission_controller = CompletionAdmissionController(
@@ -257,6 +261,10 @@ def create_openai_router(
         max_pending_approvals=config.server.max_pending_approvals,
     )
     router.admission_controller = admission_controller  # type: ignore[attr-defined]
+    response_cache = response_cache or ResponseCache()
+    project_quota_guard = project_quota_guard or ProjectQuotaGuard()
+    router.response_cache = response_cache  # type: ignore[attr-defined]
+    router.project_quota_guard = project_quota_guard  # type: ignore[attr-defined]
     sanitizer = DLPSanitizer(
         entropy_threshold=config.dlp.entropy_scan.threshold,
         entropy_min_length=config.dlp.entropy_scan.min_length,
@@ -363,9 +371,33 @@ def create_openai_router(
     @router.post("/chat/completions", dependencies=[Depends(verify_gateway_auth)])
     async def chat_completions(request: Request) -> Response:
         correlation_id = request.headers.get("X-Correlation-ID") or secrets.token_hex(8)
+        project_id = request.headers.get("X-Project-ID", "default").strip()
+        requested_priority = request.headers.get("X-Project-Priority", None)
+
+        # A03: Project Quota & Rate Limiting check
+        allowed, retry_after, effective_priority = project_quota_guard.check_quota(project_id, requested_priority)
+        if not allowed:
+            project_quota_guard.record_outcome(project_id, effective_priority, error=True)
+            return JSONResponse(
+                status_code=429,
+                content=make_openai_error(
+                    f"Rate limit exceeded for project '{project_id}' (priority: {effective_priority}). Please retry in {retry_after}s.",
+                    "rate_limit_error",
+                    code="project_rate_limit_exceeded",
+                    correlation_id=correlation_id,
+                ),
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-Correlation-ID": correlation_id,
+                    "X-Project-ID": project_id,
+                    "X-Project-Priority": effective_priority,
+                },
+            )
+
         try:
             await admission_controller.acquire_completion()
         except AdmissionLimitExceeded as ale:
+            project_quota_guard.record_outcome(project_id, effective_priority, error=True)
             return JSONResponse(
                 status_code=429,
                 content=make_openai_error(
@@ -374,7 +406,7 @@ def create_openai_router(
                     code="gateway_overloaded",
                     correlation_id=correlation_id,
                 ),
-                headers={"Retry-After": str(ale.retry_after), "X-Correlation-ID": correlation_id},
+                headers={"Retry-After": str(ale.retry_after), "X-Correlation-ID": correlation_id, "X-Project-ID": project_id},
             )
 
         held_completion_slot = True
@@ -518,6 +550,38 @@ def create_openai_router(
                 if validated.tools is not None
                 else None
             )
+
+            # A02: Deterministic Response Cache check
+            cache_ttl_header = request.headers.get("X-Cache-TTL")
+            cache_disabled = cache_ttl_header == "0"
+            temp = validated.temperature if validated.temperature is not None else 1.0
+            is_cache_eligible = (not is_stream) and (not cache_disabled) and (temp <= 0.3 or request.headers.get("X-Cache", "").lower() == "true")
+            cache_key = None
+            cache_ttl = float(cache_ttl_header) if (cache_ttl_header and cache_ttl_header.isdigit() and int(cache_ttl_header) > 0) else None
+
+            if is_cache_eligible:
+                resp_fmt = validated.response_format.model_dump(exclude_none=True) if validated.response_format else None
+                cache_key = response_cache.compute_cache_key(
+                    requested_model,
+                    messages_data,
+                    tools_data,
+                    resp_fmt,
+                )
+                cached = response_cache.get(cache_key)
+                if cached:
+                    project_quota_guard.record_outcome(project_id, effective_priority, cache_hit=True)
+                    if held_completion_slot:
+                        await admission_controller.release_completion()
+                        held_completion_slot = False
+                    return JSONResponse(
+                        content=cached["content"],
+                        headers={
+                            "X-Correlation-ID": correlation_id,
+                            "X-Gateway-Cache": "HIT",
+                            "X-Cache-TTL-Remaining": str(cached["remaining_ttl"]),
+                            "X-Project-ID": project_id,
+                        },
+                    )
 
             # 2. DLP Scan & Dual Projections: Outbound vs Audit (R2-02, R2-03)
             risk_actions = {
@@ -1115,7 +1179,19 @@ def create_openai_router(
                     await storage_db.update_model_metrics(config.db_path, candidate["id"], latency_ms, True, tokens_used=tokens_used)
                     balancer.record_active_model(candidate, candidates, failed_attempts, tokens_used=tokens_used)
 
-                    return JSONResponse(content=resp_json, headers={"X-Correlation-ID": correlation_id})
+                    if is_cache_eligible and cache_key:
+                        response_cache.set(cache_key, resp_json, ttl_seconds=cache_ttl)
+
+                    project_quota_guard.record_outcome(project_id, effective_priority, tokens_estimated=tokens_used)
+
+                    return JSONResponse(
+                        content=resp_json,
+                        headers={
+                            "X-Correlation-ID": correlation_id,
+                            "X-Gateway-Cache": "MISS",
+                            "X-Project-ID": project_id,
+                        },
+                    )
 
                 except InvalidUpstreamToolArgumentsError as itae:
                     logger.error("Upstream candidate %s returned invalid tool arguments JSON: %s", candidate["id"], itae)
@@ -1131,6 +1207,7 @@ def create_openai_router(
 
             # Check if total completion deadline was exceeded
             if deadline_exceeded or (time.perf_counter() - start_candidates_time) >= total_completion_deadline:
+                project_quota_guard.record_outcome(project_id, effective_priority, error=True)
                 return JSONResponse(
                     status_code=504,
                     content=make_openai_error(
@@ -1139,10 +1216,11 @@ def create_openai_router(
                         code="gateway_timeout",
                         correlation_id=correlation_id,
                     ),
-                    headers={"X-Correlation-ID": correlation_id},
+                    headers={"X-Correlation-ID": correlation_id, "X-Project-ID": project_id},
                 )
 
             # All candidates failed (R2-07: Sanitized error response without leaking upstream payload)
+            project_quota_guard.record_outcome(project_id, effective_priority, error=True)
             return JSONResponse(
                 status_code=502,
                 content=make_openai_error(
@@ -1151,7 +1229,7 @@ def create_openai_router(
                     code="bad_gateway",
                     correlation_id=correlation_id,
                 ),
-                headers={"X-Correlation-ID": correlation_id},
+                headers={"X-Correlation-ID": correlation_id, "X-Project-ID": project_id},
             )
         finally:
             if held_approval_slot:
