@@ -126,8 +126,9 @@ class TieredPositionManager:
         entry_price_usd: float,
         invested_usd: float,
         initial_quantity: Optional[float] = None,
+        execute_onchain: bool = False,
     ) -> PositionState:
-        """Opens a new position with hard stop-loss at -18%."""
+        """Opens a new position with hard stop-loss at -18% and optional live DEX execution."""
         clean_addr = token_address.strip()
         clean_symbol = token_symbol.strip().upper()
         clean_chain = chain.strip().lower()
@@ -137,10 +138,34 @@ class TieredPositionManager:
         if invested_usd <= 0:
             raise ValueError("Invested amount must be positive")
 
+        onchain_tx_hash = None
+        if execute_onchain:
+            try:
+                from ecosystem.smart_money.dex_executor import live_dex_executor
+            except ImportError:
+                from dex_executor import live_dex_executor
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            try:
+                res = loop.run_until_complete(live_dex_executor.execute_buy(chain=clean_chain, token_address=clean_addr, amount_usd=invested_usd))
+            finally:
+                loop.close()
+
+            if not res.get("success"):
+                if os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes"):
+                    raise RuntimeError(f"On-Chain Execution Failed: {res.get('message', res.get('error'))}")
+            else:
+                onchain_tx_hash = res.get("tx_hash")
+
         qty = initial_quantity if (initial_quantity and initial_quantity > 0) else (invested_usd / entry_price_usd)
         hard_sl = entry_price_usd * 0.82  # -18% hard stop loss
 
         pos_id = f"pos_{clean_chain}_{int(time.time())}_{clean_symbol}"
+        initial_event = f"Vào lệnh mua ${invested_usd:.2f} ({qty:.4f} {clean_symbol}) tại giá ${entry_price_usd:.6f}. SL cứng -18%."
+        if onchain_tx_hash:
+            initial_event += f" [On-Chain Hash: {onchain_tx_hash}]"
+
         pos = PositionState(
             position_id=pos_id,
             token_address=clean_addr,
@@ -156,7 +181,7 @@ class TieredPositionManager:
             realized_usd=0.0,
             stop_loss_price_usd=hard_sl,
             status="OPEN",
-            events_log=[f"Vào lệnh mua ${invested_usd:.2f} ({qty:.4f} {clean_symbol}) tại giá ${entry_price_usd:.6f}. SL cứng -18%."],
+            events_log=[initial_event],
         )
         self._save_position(pos)
         self._notify_event("smart_money.position_opened", {
@@ -166,8 +191,10 @@ class TieredPositionManager:
             "entry_price": pos.entry_price_usd,
             "invested_usd": pos.invested_usd,
             "stop_loss": pos.stop_loss_price_usd,
+            "tx_hash": onchain_tx_hash,
         })
         return pos
+
 
     def update_price(
         self,

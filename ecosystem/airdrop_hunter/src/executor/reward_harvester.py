@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.storage.farming_db import FarmingDatabase
+try:
+    from ecosystem.airdrop_hunter.src.storage.farming_db import FarmingDatabase
+except ImportError:
+    from src.storage.farming_db import FarmingDatabase
+
+
 
 logger = logging.getLogger("reward_harvester")
 
@@ -19,6 +24,60 @@ class RewardHarvester:
     def __init__(self, db: FarmingDatabase, hub_node: Optional[Any] = None):
         self.db = db
         self.hub_node = hub_node
+
+    def audit_real_onchain_balances(self, wallet_address: str) -> Dict[str, Any]:
+        """Queries live on-chain balances (Native ETH, WETH, USDC) directly from Base L2 RPC."""
+        import json
+        import urllib.request
+        from ecosystem.airdrop_hunter.src.executor.onchain_signer import BASE_RPC_URL, BASE_WETH_ADDRESS
+
+        usdc_addr = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        clean_addr = wallet_address.lower().strip()
+        result = {
+            "wallet": clean_addr,
+            "eth_balance": 0.0,
+            "weth_balance": 0.0,
+            "usdc_balance": 0.0,
+            "live_verified": False,
+        }
+
+        try:
+            # 1. Native ETH
+            req_eth = urllib.request.Request(
+                BASE_RPC_URL,
+                data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [clean_addr, "latest"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": "AIFreeGateway/1.0"},
+            )
+            with urllib.request.urlopen(req_eth, timeout=5.0) as resp:
+                eth_hex = json.loads(resp.read().decode("utf-8")).get("result", "0x0")
+                result["eth_balance"] = round(int(eth_hex, 16) / 1e18, 6)
+
+            # 2. WETH Balance
+            padded_addr = clean_addr[2:].rjust(64, "0")
+            req_weth = urllib.request.Request(
+                BASE_RPC_URL,
+                data=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "eth_call", "params": [{"to": BASE_WETH_ADDRESS, "data": "0x70a08231" + padded_addr}, "latest"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": "AIFreeGateway/1.0"},
+            )
+            with urllib.request.urlopen(req_weth, timeout=5.0) as resp:
+                weth_hex = json.loads(resp.read().decode("utf-8")).get("result", "0x0")
+                result["weth_balance"] = round(int(weth_hex, 16) / 1e18, 6)
+
+            # 3. USDC Balance (6 decimals)
+            req_usdc = urllib.request.Request(
+                BASE_RPC_URL,
+                data=json.dumps({"jsonrpc": "2.0", "id": 3, "method": "eth_call", "params": [{"to": usdc_addr, "data": "0x70a08231" + padded_addr}, "latest"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": "AIFreeGateway/1.0"},
+            )
+            with urllib.request.urlopen(req_usdc, timeout=5.0) as resp:
+                usdc_hex = json.loads(resp.read().decode("utf-8")).get("result", "0x0")
+                result["usdc_balance"] = round(int(usdc_hex, 16) / 1e6, 2)
+
+            result["live_verified"] = True
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
 
     def evaluate_wallet_eligibility(
         self,

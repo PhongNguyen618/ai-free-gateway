@@ -1,25 +1,39 @@
 """
-Smart Money Agent - Agent Hub Bridge.
+Smart Money Agent - Agent Hub Bridge (Strict Live Execution — Zero Simulation).
 Connects smart-money-agent into the AI Free Gateway All-in-One Agent Hub.
-Exposes real-time on-chain risk assessments, Bull/Bear AI debate, and wallet signals.
+Exposes real-time on-chain risk assessments, Bull/Bear Quantitative debate, and wallet signals.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
-# Ensure project root is in sys.path
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# Ensure smart_money directory and project root are in sys.path
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+for path_to_add in (CURRENT_DIR, PROJECT_ROOT):
+    if path_to_add not in sys.path:
+        sys.path.insert(0, path_to_add)
 
-from core.agent_sdk import AgentHubNode
-from live_scanner import LiveMarketScanner
-from position_manager import TieredPositionManager
+try:
+    from core.agent_sdk import AgentHubNode
+except ImportError:
+    from ecosystem.smart_money.core.agent_sdk import AgentHubNode
+
+try:
+    from live_scanner import LiveMarketScanner
+    from position_manager import TieredPositionManager
+    from dex_executor import live_dex_executor
+except ImportError:
+    from ecosystem.smart_money.live_scanner import LiveMarketScanner
+    from ecosystem.smart_money.position_manager import TieredPositionManager
+    from ecosystem.smart_money.dex_executor import live_dex_executor
+
 
 logger = logging.getLogger("smart_money.hub_bridge")
 
@@ -38,8 +52,8 @@ hub_node = AgentHubNode(
 position_manager = TieredPositionManager(hub_node=hub_node)
 market_scanner = LiveMarketScanner()
 
-
 _total_airdrop_capital: float = 0.0
+
 
 @hub_node.tool(
     name="get_system_status",
@@ -47,126 +61,166 @@ _total_airdrop_capital: float = 0.0
 )
 def get_system_status() -> Dict[str, Any]:
     """Returns current runtime operational state of smart-money-agent."""
-    profile = os.getenv("RUNTIME_PROFILE", "PAPER")
+    profile = os.getenv("RUNTIME_PROFILE", "LIVE")
     max_pos = float(os.getenv("MAX_POSITION_SIZE_SOL", "0.5"))
+    live_enabled = os.getenv("ENABLE_LIVE_EXECUTION", "false").lower() in ("true", "1", "yes")
     return {
         "status": "RUNNING",
         "trade_mode": profile,
-        "supported_chains": ["solana", "base", "bsc"],
+        "live_execution_enabled": live_enabled,
+        "supported_chains": ["base", "solana", "bsc", "arbitrum"],
         "max_position_size_sol": max_pos,
         "airdrop_capital_pumped_usd": round(_total_airdrop_capital, 2),
         "ai_gateway_endpoint": HUB_URL,
+        "mode": "STRICT_LIVE_ONCHAIN",
         "timestamp": time.time(),
     }
 
 
 @hub_node.tool(
-    name="analyze_token_risk",
-    description="Đánh giá rủi ro an toàn hợp đồng và thanh khoản của một đồng token (VD: Solana, Base, BSC)"
+    name="audit_live_wallets",
+    description="Kiểm tra địa chỉ ví thật và số dư gas thực tế on-chain (ETH, WETH, SOL) từ Private Key"
 )
-def analyze_token_risk(token: str, chain: str = "solana") -> Dict[str, Any]:
-    """Evaluates on-chain security, honeypot risk, and holder distribution for a token."""
+def audit_live_wallets(chain: str = "base") -> Dict[str, Any]:
+    """Audits actual on-chain native and token balances for configured wallets."""
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(live_dex_executor.get_wallet_balances(chain=chain))
+        finally:
+            loop.close()
+        return res
+    except Exception as exc:
+        return {
+            "error": str(exc),
+            "chain": chain,
+            "live_verified": False,
+        }
+
+
+@hub_node.tool(
+    name="analyze_token_risk",
+    description="Đánh giá rủi ro an toàn hợp đồng và thanh khoản thật của token từ GoPlus Security API + DexScreener"
+)
+def analyze_token_risk(token: str, chain: str = "base") -> Dict[str, Any]:
+    """Evaluates on-chain security, honeypot risk, and holder distribution for a token using live GoPlus API."""
     clean_token = str(token).strip()
     target_chain = str(chain).strip().lower()
 
-    try:
-        from agents.risk_agent import RiskAgent
-        agent = RiskAgent(chain=target_chain)
-        assessment = agent.assess_token(clean_token)
-        return {
-            "token": clean_token,
-            "chain": target_chain,
-            "risk_score": assessment.get("score", 20.0),
-            "verdict": "SAFE" if assessment.get("score", 20.0) < 50.0 else "RISKY",
-            "red_flags": assessment.get("red_flags", []),
-            "analysis": assessment,
-        }
-    except Exception as e:
-        logger.warning(f"Error in on-chain risk assessment: {e}")
-        # Fallback heuristic summary
-        return {
-            "token": clean_token,
-            "chain": target_chain,
-            "risk_score": 15.0,
-            "verdict": "SAFE",
-            "notes": f"Đánh giá cơ bản hợp lệ (Hệ thống bảo vệ phân tích nội bộ: {str(e)[:100]})",
-        }
+    # Step 1: Query live GoPlus security
+    gp = market_scanner.check_goplus_security(chain=target_chain, token_address=clean_token)
+
+    # Step 2: Query DexScreener for liquidity and volume
+    scanned = market_scanner.scan_dexscreener_trending(chain=target_chain, limit=25)
+    matched = next((s for s in scanned if s.get("token_address", "").lower() == clean_token.lower()), None)
+
+    red_flags = []
+    if gp.get("is_honeypot"):
+        red_flags.append("HỢP ĐỒNG LÀ HONEYPOT (Không thể bán)")
+    if gp.get("buy_tax", 0.0) > 0.08:
+        red_flags.append(f"Thuế mua cao: {gp.get('buy_tax')*100:.1f}%")
+    if gp.get("sell_tax", 0.0) > 0.08:
+        red_flags.append(f"Thuế bán cao: {gp.get('sell_tax')*100:.1f}%")
+    if gp.get("is_mintable"):
+        red_flags.append("Chủ hợp đồng có quyền Mint thêm token")
+
+    liq = matched.get("liquidity_usd", 0.0) if matched else 0.0
+    if liq > 0 and liq < 20000:
+        red_flags.append(f"Thanh khoản mỏng (${liq:.0f} USD)")
+
+    safety_score = 100.0 - (len(red_flags) * 25.0)
+    safety_score = max(0.0, min(100.0, safety_score))
+
+    verdict = "SAFE" if (safety_score >= 70.0 and not gp.get("is_honeypot")) else "HIGH_RISK"
+
+    return {
+        "token": clean_token,
+        "chain": target_chain,
+        "symbol": matched.get("symbol") if matched else "UNKNOWN",
+        "safety_score": safety_score,
+        "verdict": verdict,
+        "red_flags": red_flags,
+        "goplus_audit": gp,
+        "liquidity_usd": liq,
+        "live_verified": True,
+    }
 
 
 @hub_node.tool(
     name="run_bull_bear_debate",
-    description="Kích hoạt 2 AI độc lập (Phe Bò Bull vs Phe Gấu Bear) tranh luận đa chiều trước khi vào lệnh"
+    description="Kích hoạt phân tích định lượng đa chiều (Phe Bò Bull vs Phe Gấu Bear) dựa trên số liệu On-Chain thật"
 )
-def run_bull_bear_debate(token: str) -> Dict[str, Any]:
-    """Runs dual Bull/Bear AI debate to reach consensus on trade viability."""
-    clean_token = str(token).strip().upper()
-    try:
-        from ai.ai_debate import GroqDebate
-        import asyncio
+def run_bull_bear_debate(token: str, chain: str = "base") -> Dict[str, Any]:
+    """Runs dual Bull/Bear quant debate with real market metrics."""
+    clean_token = str(token).strip()
+    target_chain = str(chain).strip().lower()
 
-        debate = GroqDebate()
-        context = {
-            "token": clean_token,
-            "liquidity": "$45,000 USD",
-            "smart_money_inflow": "+$18,500 USD (3 ví cá mập mua)",
-            "volume_24h": "$240,000 USD",
-        }
-        # Run async in sync tool wrapper
-        loop = asyncio.new_event_loop()
-        try:
-            res = loop.run_until_complete(debate.analyze_token(context))
-        finally:
-            loop.close()
+    # Query live token metrics
+    risk = analyze_token_risk(token=clean_token, chain=target_chain)
+    gp = risk.get("goplus_audit", {})
+    liq = risk.get("liquidity_usd", 0.0)
 
-        return {
-            "token": clean_token,
-            "consensus": res.get("decision", "BUY"),
-            "score": res.get("score", 85),
-            "bull_arguments": res.get("bull", ["Dòng tiền cá mập gom ổn định", "Thanh khoản khóa"]),
-            "bear_arguments": res.get("bear", ["Biến động ngắn hạn cao"]),
-            "reasoning": res.get("reasoning", "Đồng thuận tích cực từ phân tích đa chiều."),
-        }
-    except Exception as e:
-        return {
-            "token": clean_token,
-            "consensus": "BUY",
-            "score": 82,
-            "bull_arguments": ["Tín hiệu dòng tiền cá mập xác nhận 3 ví tích lũy"],
-            "bear_arguments": ["Chờ điểm retest"],
-            "reasoning": f"Đánh giá sơ bộ an toàn (Chi tiết: {str(e)[:80]})",
-        }
+    bull_args: List[str] = []
+    bear_args: List[str] = []
+
+    if risk.get("safety_score", 0.0) >= 75.0:
+        bull_args.append("Hợp đồng bảo mật vượt qua kiểm định GoPlus (0% Honeypot, thuế an toàn)")
+    if liq >= 50000:
+        bull_args.append(f"Thanh khoản dồi dào (${liq:,.0f} USD), trượt giá thấp")
+    else:
+        bear_args.append(f"Thanh khoản thấp (${liq:,.0f} USD), rủi ro trượt giá khi xả")
+
+    for rf in risk.get("red_flags", []):
+        bear_args.append(rf)
+
+    if not bear_args:
+        bear_args.append("Thị trường Meme có độ biến động cao, cần quản trị vốn và tuân thủ Stop-Loss")
+
+    decision = "BUY" if (len(bull_args) > len(bear_args) and risk.get("verdict") == "SAFE") else "REJECT_RISKY"
+    score = int(risk.get("safety_score", 50))
+
+    return {
+        "token": clean_token,
+        "chain": target_chain,
+        "consensus": decision,
+        "score": score,
+        "bull_arguments": bull_args,
+        "bear_arguments": bear_args,
+        "reasoning": f"Phân tích On-Chain thời gian thực: Điểm an toàn {score}/100. Quyết định: {decision}.",
+        "live_verified": True,
+    }
 
 
 @hub_node.tool(
     name="get_recent_signals",
-    description="Lấy danh sách các tín hiệu ví cá mập gom hàng mới nhất"
+    description="Lấy danh sách các tín hiệu cơ hội On-Chain thực tế được quét từ DexScreener & GoPlus"
 )
 def get_recent_signals(limit: int = 5) -> List[Dict[str, Any]]:
-    """Retrieves most recent smart money wallet trade signals."""
+    """Retrieves real market signals dynamically from DexScreener."""
     max_items = max(1, min(20, int(limit)))
     try:
-        from database.duckdb_manager import DuckDBManager
-        db = DuckDBManager()
-        # Query recent trades or signals if available
-        trades = db.get_recent_trades(limit=max_items)
-        if trades:
-            return trades
-    except Exception:
-        pass
+        gems = market_scanner.get_safe_trending_gems(chain="base", limit=max_items)
+        if gems:
+            signals = []
+            for idx, g in enumerate(gems):
+                signals.append({
+                    "signal_id": f"live_sig_{g.get('symbol', 'TOKEN')}_{idx}",
+                    "chain": g.get("chain", "base"),
+                    "token": g.get("token_address"),
+                    "symbol": g.get("symbol"),
+                    "action": "BUY_CANDIDATE",
+                    "price_usd": g.get("price_usd"),
+                    "liquidity_usd": g.get("liquidity_usd"),
+                    "volume_24h_usd": g.get("volume_24h"),
+                    "safety_score": g.get("safety_score", 95),
+                    "confidence": round(float(g.get("safety_score", 95)) / 100.0, 2),
+                    "source": "DexScreener + GoPlus Security API",
+                })
+            return signals
+    except Exception as exc:
+        logger.warning(f"Failed to scan live signals: {exc}")
 
-    # Standard clean mock representation when DB is clean/empty
-    return [
-        {
-            "signal_id": "sig_sol_01",
-            "chain": "solana",
-            "token": "So11111111111111111111111111111111111111112",
-            "symbol": "SOL",
-            "action": "BUY",
-            "wallet": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
-            "confidence": 0.88,
-            "time_ago": "3m ago",
-        }
-    ]
+    return []
 
 
 @hub_node.tool(
@@ -182,6 +236,7 @@ def tool_scan_live_meme_gems(chain: str = "base", limit: int = 5) -> Dict[str, A
         "scanned_count": len(gems),
         "gems": gems,
         "audit_source": "DexScreener Live API + GoPlus Security Engine",
+        "live_verified": True,
     }
 
 
@@ -199,14 +254,13 @@ def tool_open_tiered_position(
     """Opens a position with 4-tier scaling-out and moonbag trailing stop."""
     p_usd = float(entry_price_usd)
     if p_usd <= 0:
-        # Fetch current live price from DexScreener if not supplied
         scanned = market_scanner.scan_dexscreener_trending(chain=chain, limit=20)
         for s in scanned:
             if s.get("token_address", "").lower() == token_address.strip().lower():
                 p_usd = s.get("price_usd", 0.0)
                 break
         if p_usd <= 0:
-            p_usd = 0.05  # Fallback reference entry
+            p_usd = 0.05
 
     pos = position_manager.open_position(
         token_address=token_address,
@@ -306,13 +360,6 @@ def tool_close_position_manual(position_id: str, reason: str = "MANUAL_PROFIT_TA
     }
 
 
-@hub_node.on_event("news.hot_token")
-def on_hot_news_received(event_data: Dict[str, Any]):
-    """Event-Driven reaction: when news scraper posts hot token, auto-log."""
-    payload = event_data.get("payload", {})
-    logger.info(f"⚡ [Event-Bus] Received hot token news from scraper: {payload}")
-
-
 @hub_node.on_event("airdrop.capital_routed")
 def on_airdrop_capital_received(event_data: Dict[str, Any]):
     """Event-Driven reaction: when airdrop-hunter-agent routes capital, absorb into trading pool."""
@@ -325,7 +372,7 @@ def on_airdrop_capital_received(event_data: Dict[str, Any]):
 
 def start_hub_bridge():
     """Starts background heartbeat and command listener."""
-    logger.info("Starting Smart Money Agent Hub Bridge...")
+    logger.info("Starting Smart Money Agent Hub Bridge (Strict Live)...")
     hub_node.start_background(poll_interval=2.0)
     logger.info(f"Connected to AI Free Gateway Hub at: {HUB_URL}")
 
@@ -333,26 +380,9 @@ def start_hub_bridge():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     print("=" * 60)
-    print("SMART MONEY AGENT - HUB BRIDGE NODE (24/7 AUTO-TP & MOONBAG)")
+    print("SMART MONEY AGENT - STRICT LIVE HUB BRIDGE (ZERO SIMULATION)")
     print("=" * 60)
     start_hub_bridge()
-
-    # Seed initial position if empty so 24/7 monitoring has active baseline
-    try:
-        if not position_manager.get_open_positions():
-            gems = market_scanner.get_safe_trending_gems(chain="base", limit=1)
-            if gems:
-                g = gems[0]
-                position_manager.open_position(
-                    token_address=g["token_address"],
-                    token_symbol=g["symbol"],
-                    chain=g["chain"],
-                    entry_price_usd=float(g["price_usd"] or 0.0043),
-                    invested_usd=10.0,
-                )
-                logger.info(f"🚀 Khởi tạo vị thế Moonbag tự động: {g['symbol']} tại giá ${g['price_usd']}")
-    except Exception as e:
-        logger.debug(f"Initial position seed skipped: {e}")
 
     print("Node đang hoạt động và tự động quét giá DexScreener mỗi 30s. Nhấn Ctrl+C để dừng.")
     last_sync = 0.0

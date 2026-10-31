@@ -55,47 +55,54 @@ class BaseWethSigner:
                 "gas_price_gwei": gas_price_gwei,
             }
 
-        # Step 2: Attempt real on-chain transaction if private key available
-        if self.private_key and len(self.private_key.strip()) >= 64:
-            try:
-                tx_hash = self._sign_and_broadcast_weth(clean_action, amount_eth)
-                explorer_url = f"https://basescan.org/tx/{tx_hash}"
-                return {
-                    "status": "LIVE_ONCHAIN_CONFIRMED",
-                    "action": f"WETH_{clean_action.upper()}",
-                    "wallet": wallet_address,
-                    "amount_eth": amount_eth,
-                    "network": "Base L2 Mainnet",
-                    "contract": BASE_WETH_ADDRESS,
-                    "gas_price_gwei": gas_price_gwei,
-                    "estimated_fee_usd": round(gas_price_gwei * 0.00005, 6),
-                    "tx_hash": tx_hash,
-                    "explorer_url": explorer_url,
-                    "mode": "REAL_WEB3_BROADCAST",
-                    "timestamp": now_ts,
-                }
-            except Exception as e:
-                logger.warning(f"On-chain broadcast fallback: {e}")
+        # Step 2: Strict Live On-Chain Transaction
+        if not self.private_key or len(self.private_key.strip()) < 64:
+            return {
+                "status": "FAILED_NO_PRIVATE_KEY",
+                "action": f"WETH_{clean_action.upper()}",
+                "wallet": wallet_address,
+                "amount_eth": amount_eth,
+                "network": "Base L2 Mainnet",
+                "contract": BASE_WETH_ADDRESS,
+                "live_verified": False,
+                "error": "MISSING_EVM_PRIVATE_KEY",
+                "message": "Không tìm thấy EVM_PRIVATE_KEY để ký giao dịch thật. Hệ thống tuân thủ Strict Live 100%, tuyệt đối không sinh Hash giả.",
+                "timestamp": now_ts,
+            }
 
-        # Step 3: Simulation / Zero-Key Mode
-        import hashlib
-        seed = f"{wallet_address.lower()}_{clean_action}_{now_ts}"
-        sim_hash = "0x" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
-        return {
-            "status": "SIMULATION_VERIFIED",
-            "action": f"WETH_{clean_action.upper()}",
-            "wallet": wallet_address,
-            "amount_eth": amount_eth,
-            "network": "Base L2 (Zero Fee WETH)",
-            "contract": BASE_WETH_ADDRESS,
-            "gas_price_gwei": gas_price_gwei,
-            "estimated_fee_usd": 0.0003,
-            "tx_hash": sim_hash,
-            "explorer_url": f"https://basescan.org/tx/{sim_hash}",
-            "mode": "RPC_VERIFIED_SIMULATION",
-            "note": "Cấu hình EVM_PRIVATE_KEY trên Render nếu muốn bot tự động ký on-chain thật.",
-            "timestamp": now_ts,
-        }
+        try:
+            tx_hash = self._sign_and_broadcast_weth(clean_action, amount_eth)
+            explorer_url = f"https://basescan.org/tx/{tx_hash}"
+            return {
+                "status": "LIVE_ONCHAIN_CONFIRMED",
+                "action": f"WETH_{clean_action.upper()}",
+                "wallet": wallet_address,
+                "amount_eth": amount_eth,
+                "network": "Base L2 Mainnet",
+                "contract": BASE_WETH_ADDRESS,
+                "gas_price_gwei": gas_price_gwei,
+                "estimated_fee_usd": round(gas_price_gwei * 0.00005, 6),
+                "tx_hash": tx_hash,
+                "explorer_url": explorer_url,
+                "mode": "REAL_WEB3_BROADCAST",
+                "live_verified": True,
+                "timestamp": now_ts,
+            }
+        except Exception as e:
+            logger.error(f"On-chain broadcast error on Base: {e}")
+            return {
+                "status": "BROADCAST_FAILED",
+                "action": f"WETH_{clean_action.upper()}",
+                "wallet": wallet_address,
+                "amount_eth": amount_eth,
+                "network": "Base L2 Mainnet",
+                "contract": BASE_WETH_ADDRESS,
+                "live_verified": False,
+                "error": str(e),
+                "message": f"Giao dịch on-chain thất bại: {e}. Hệ thống Fail-Closed và không tạo hash giả.",
+                "timestamp": now_ts,
+            }
+
 
     def _get_gas_price_gwei(self) -> float:
         payload = {"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}

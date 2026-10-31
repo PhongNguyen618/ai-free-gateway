@@ -7,8 +7,13 @@ import random
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.config import PERSONA_ARCHETYPES
-from src.storage.farming_db import FarmingDatabase
+try:
+    from ecosystem.airdrop_hunter.src.config import PERSONA_ARCHETYPES
+    from ecosystem.airdrop_hunter.src.storage.farming_db import FarmingDatabase
+except ImportError:
+    from src.config import PERSONA_ARCHETYPES
+    from src.storage.farming_db import FarmingDatabase
+
 
 
 class SybilClusterViolationError(Exception):

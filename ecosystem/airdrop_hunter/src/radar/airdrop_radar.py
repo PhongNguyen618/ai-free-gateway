@@ -11,9 +11,15 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from src.agent_sdk import UniversalAIClient
-from src.config import ALPHA_THRESHOLD_HIGH, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
-from src.storage.farming_db import FarmingDatabase
+try:
+    from ecosystem.airdrop_hunter.src.agent_sdk import UniversalAIClient
+    from ecosystem.airdrop_hunter.src.config import ALPHA_THRESHOLD_HIGH, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
+    from ecosystem.airdrop_hunter.src.storage.farming_db import FarmingDatabase
+except ImportError:
+    from src.agent_sdk import UniversalAIClient
+    from src.config import ALPHA_THRESHOLD_HIGH, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
+    from src.storage.farming_db import FarmingDatabase
+
 
 logger = logging.getLogger("airdrop_radar")
 

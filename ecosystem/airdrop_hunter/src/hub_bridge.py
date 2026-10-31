@@ -11,15 +11,27 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
-from src.agent_sdk import AgentHubNode
-from src.anti_sybil.persona_engine import PersonaEngine
-from src.config import DB_PATH, FARMING_MODE, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
-from src.executor.farming_executor import FarmingExecutor
-from src.executor.onchain_signer import BaseWethSigner, DefiYieldScanner
-from src.executor.reward_harvester import RewardHarvester
-from src.executor.rpc_client import MultiChainRPCClient
-from src.radar.airdrop_radar import AirdropRadar
-from src.storage.farming_db import FarmingDatabase
+try:
+    from ecosystem.airdrop_hunter.src.agent_sdk import AgentHubNode
+    from ecosystem.airdrop_hunter.src.anti_sybil.persona_engine import PersonaEngine
+    from ecosystem.airdrop_hunter.src.config import DB_PATH, FARMING_MODE, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
+    from ecosystem.airdrop_hunter.src.executor.farming_executor import FarmingExecutor
+    from ecosystem.airdrop_hunter.src.executor.onchain_signer import BaseWethSigner, DefiYieldScanner
+    from ecosystem.airdrop_hunter.src.executor.reward_harvester import RewardHarvester
+    from ecosystem.airdrop_hunter.src.executor.rpc_client import MultiChainRPCClient
+    from ecosystem.airdrop_hunter.src.radar.airdrop_radar import AirdropRadar
+    from ecosystem.airdrop_hunter.src.storage.farming_db import FarmingDatabase
+except ImportError:
+    from src.agent_sdk import AgentHubNode
+    from src.anti_sybil.persona_engine import PersonaEngine
+    from src.config import DB_PATH, FARMING_MODE, GATEWAY_API_KEY, GATEWAY_URL, PROJECT_ID
+    from src.executor.farming_executor import FarmingExecutor
+    from src.executor.onchain_signer import BaseWethSigner, DefiYieldScanner
+    from src.executor.reward_harvester import RewardHarvester
+    from src.executor.rpc_client import MultiChainRPCClient
+    from src.radar.airdrop_radar import AirdropRadar
+    from src.storage.farming_db import FarmingDatabase
+
 
 logger = logging.getLogger("hub_bridge")
 

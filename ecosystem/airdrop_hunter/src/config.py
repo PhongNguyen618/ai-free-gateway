@@ -15,8 +15,8 @@ GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000").rstrip("/")
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "sk-local-dev-token")
 PROJECT_ID = "airdrop-hunter-agent"
 
-# Farming Operating Mode: 'SIMULATION' (an toàn tuyệt đối, 0đ rủi ro) or 'LIVE' (thực thi on-chain)
-FARMING_MODE = os.getenv("FARMING_MODE", "SIMULATION").upper()
+# Farming Operating Mode: 'LIVE' (thực thi on-chain thật 100%, Fail-Closed) or 'SIMULATION'
+FARMING_MODE = os.getenv("FARMING_MODE", "LIVE").upper()
 
 # Database Path
 DB_PATH = os.getenv("AIRDROP_DB_PATH", str(DATA_DIR / "airdrop_hunter.db"))

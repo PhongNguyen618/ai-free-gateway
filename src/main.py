@@ -650,6 +650,19 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             "is_configured": telegram_notifier.is_configured,
         }
 
+    @app.get("/api/hub/wallets/audit", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_wallets_audit() -> Dict[str, Any]:
+        """Kiểm tra số dư thực tế On-Chain của các ví đang cấu hình (EVM Base & Solana)."""
+        from ecosystem.smart_money.dex_executor import live_dex_executor
+        evm_data = await live_dex_executor.get_wallet_balances("base")
+        sol_data = await live_dex_executor.get_wallet_balances("solana")
+        return {
+            "mode": "STRICT_LIVE_ONCHAIN",
+            "evm": evm_data,
+            "solana": sol_data,
+        }
+
+
     # --- Mount OpenAI Compatible Proxy Router ---
     openai_router = create_openai_router(
         config=config,
