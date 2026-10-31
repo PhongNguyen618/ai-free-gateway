@@ -187,8 +187,22 @@ def _build_config(config_path: Optional[str] = None) -> AppConfig:
             raw_data.setdefault("server", {})["port"] = int(os.getenv("GATEWAY_PORT"))
         except ValueError:
             pass
+    elif os.getenv("PORT"):
+        try:
+            raw_data.setdefault("server", {})["port"] = int(os.getenv("PORT"))
+        except ValueError:
+            pass
     if os.getenv("GATEWAY_API_KEY"):
         raw_data.setdefault("server", {})["gateway_api_key"] = os.getenv("GATEWAY_API_KEY")
+    if os.getenv("ALLOW_INSECURE_EXTERNAL"):
+        val = os.getenv("ALLOW_INSECURE_EXTERNAL", "").lower() in ("true", "1", "yes")
+        raw_data.setdefault("server", {})["allow_insecure_external"] = val
+    if os.getenv("ALLOWED_HOSTS"):
+        hosts = [h.strip() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
+        raw_data.setdefault("server", {})["allowed_hosts"] = hosts
+    if os.getenv("CORS_ALLOWED_ORIGINS"):
+        origins = [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+        raw_data.setdefault("server", {})["cors_allowed_origins"] = origins
     if os.getenv("SQLITE_DB_PATH"):
         raw_data["db_path"] = os.getenv("SQLITE_DB_PATH")
 

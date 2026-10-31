@@ -123,10 +123,11 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     # F01: Strict CORS configuration (defaults to same-origin)
     allowed_origins = list(config.server.cors_allowed_origins)
     if allowed_origins:
+        allow_cred = "*" not in allowed_origins
         app.add_middleware(
             CORSMiddleware,
             allow_origins=allowed_origins,
-            allow_credentials=True,
+            allow_credentials=allow_cred,
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["*"],
         )
@@ -148,6 +149,8 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     trusted_hosts.add(f"{configured_host}:{config.server.port}")
     for h in config.server.allowed_hosts:
         trusted_hosts.add(h.lower().strip())
+    if "*" in config.server.allowed_hosts or "*" in trusted_hosts:
+        trusted_hosts.add("*")
 
     # F01 & CSRF Protection Middleware (N04, N08)
     @app.middleware("http")
@@ -158,9 +161,10 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
 
         # 1. Host header validation (N04)
         host_header = request.headers.get("host")
-        if host_header:
+        if host_header and "*" not in trusted_hosts:
             clean_host = host_header.lower().strip()
-            if clean_host not in trusted_hosts:
+            clean_host_no_port = clean_host.split(":")[0]
+            if clean_host not in trusted_hosts and clean_host_no_port not in trusted_hosts:
                 res = JSONResponse(
                     status_code=400,
                     content={"detail": f"Invalid or untrusted Host header: {host_header}"},
@@ -204,7 +208,7 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
                 and origin_host == req_host
                 and origin_port == req_port
             )
-            is_whitelisted = origin in allowed_origins
+            is_whitelisted = origin in allowed_origins or "*" in allowed_origins
 
             if not is_same_origin and not is_whitelisted:
                 res = JSONResponse(
