@@ -15,18 +15,19 @@ ENV PYTHONUNBUFFERED=1 \
     ALLOWED_HOSTS=* \
     CORS_ALLOWED_ORIGINS=*
 
-# Install python dependencies
+# Install python dependencies for Gateway & Ecosystem
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all project code
+# Copy all project code including ecosystem agents
 COPY . .
 
-# Create storage directory for SQLite database with write permissions
-RUN mkdir -p /app/storage && chmod -R 777 /app/storage
+# Create storage directories for Gateway SQLite and Airdrop Hunter DB
+RUN mkdir -p /app/storage /app/ecosystem/airdrop_hunter/data && \
+    chmod -R 777 /app/storage /app/ecosystem/airdrop_hunter/data
 
 # Expose standard container port
 EXPOSE 7860
 
-# Start server using dynamic $PORT (compatible with Hugging Face, Render, Railway, Koyeb)
-CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-7860}"]
+# Start All-in-One Multi-Process Supervisor (Gateway + Airdrop Hunter + Smart Money)
+CMD ["python", "ecosystem_supervisor.py"]
