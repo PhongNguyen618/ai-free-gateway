@@ -18,6 +18,7 @@ from src.discovery.harvester import ModelHarvester
 from src.hub.event_bus import SharedEventBus
 from src.hub.orchestrator import AIAutoOrchestrator
 from src.hub.registry import ProjectRegistry
+from src.hub.telegram_notifier import TelegramHubNotifier
 from src.lifecycle import InstanceLock, InstanceAlreadyRunningError
 from src.router.balancer import ModelBalancer
 from src.router.openai_proxy import create_openai_router, make_openai_error
@@ -65,6 +66,13 @@ class HubOrchestrateRequest(BaseModel):
     model_tier: Optional[str] = "reasoning"
 
 
+class HubCallToolRequest(BaseModel):
+    project_id: str
+    tool_name: str
+    arguments: Optional[Dict[str, Any]] = None
+    timeout: Optional[float] = 30.0
+
+
 def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     """
     Application Factory for AI Free Gateway.
@@ -96,9 +104,11 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
     response_cache = ResponseCache()
     project_quota_guard = ProjectQuotaGuard()
     project_registry = ProjectRegistry()
+    telegram_notifier = TelegramHubNotifier()
     shared_event_bus = SharedEventBus(
         persistence_callback=lambda evt: storage_db.save_hub_event(config.db_path, evt)
     )
+    shared_event_bus.subscribe(lambda evt: telegram_notifier.handle_event(evt))
 
     async def internal_ai_chat(messages: List[Dict[str, str]], model_tier: str = "reasoning") -> str:
         # S02: 1. Deterministic Cache Check
@@ -586,6 +596,44 @@ def create_app(app_config: Optional[AppConfig] = None) -> FastAPI:
             user_query=payload.query,
             model_tier=payload.model_tier or "reasoning",
         )
+
+    @app.post("/api/hub/call", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_call_tool(payload: HubCallToolRequest) -> Dict[str, Any]:
+        """Thực thi trực tiếp 1 công cụ trên node dự án con (1-Click Tool Execution)."""
+        try:
+            result = await project_registry.dispatch_command(
+                project_id=payload.project_id,
+                tool_name=payload.tool_name,
+                arguments=payload.arguments or {},
+                timeout=payload.timeout or 30.0,
+            )
+            return {"status": "success", "result": result}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    @app.post("/api/hub/telegram/test", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_telegram_test() -> Dict[str, Any]:
+        """Gửi báo cáo tóm tắt tình trạng hệ thống về Telegram."""
+        if not telegram_notifier.is_configured:
+            return {
+                "status": "NOT_CONFIGURED",
+                "message": "Chưa cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID trên server.",
+            }
+        sent = telegram_notifier.send_message(
+            "📲 <b>[Test Báo Cáo]</b> Kết nối Telegram từ Gateway thành công! Hệ thống 3 dự án đang ONLINE 24/7."
+        )
+        return {
+            "status": "SENT" if sent else "FAILED",
+            "message": "Đã gửi thông báo thành công về Telegram của bạn!" if sent else "Gửi thất bại, hãy kiểm tra lại Token hoặc Chat ID.",
+        }
+
+    @app.get("/api/hub/telegram/status", tags=["Agent Hub"], dependencies=[Depends(verify_auth)])
+    async def hub_telegram_status() -> Dict[str, Any]:
+        """Xem trạng thái cấu hình Telegram."""
+        return {
+            "is_configured": telegram_notifier.is_configured,
+            "chat_id_configured": bool(telegram_notifier.chat_id),
+        }
 
     # --- Mount OpenAI Compatible Proxy Router ---
     openai_router = create_openai_router(

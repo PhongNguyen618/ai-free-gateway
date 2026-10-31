@@ -124,21 +124,40 @@ def run_daemon_loop():
     db, radar, persona_engine, _, executor = get_farming_components()
     harvester = RewardHarvester(db=db)
 
+    # Seed initial wallets if empty
+    stored_wallets = db.list_wallets()
+    if not stored_wallets:
+        init_wallets = [
+            "0x71c6bf00a49be0834277b0292bfef32342ef0123",
+            "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260456",
+        ]
+        for w in init_wallets:
+            p = persona_engine.generate_persona_for_wallet(w)
+            db.upsert_wallet(w, chain_type="EVM", persona_id=p["archetype_id"], persona_details=p)
+        print(f"[*] Đã khởi tạo {len(init_wallets)} ví cày mẫu ban đầu.")
+
     try:
         cycle_count = 0
         while True:
             cycle_count += 1
             print(f"\n--- [Chu kỳ tự hành #{cycle_count}] ---")
             # 1. Quét kèo
-            radar.scan_and_evaluate(include_live_defillama=True)
-            # 2. Duyệt ví theo active window
+            campaigns = radar.scan_and_evaluate(include_live_defillama=True)
+            if cycle_count == 1 and campaigns:
+                top = campaigns[0]
+                print(f"[*] Top Kèo Airdrop: {top['name']} ({top.get('alpha_score', 0)} pts)")
+
+            # 2. Duyệt ví theo active window (chu kỳ 1 ép chạy để có dữ liệu on-chain ngay)
             wallets = db.list_wallets()
-            for w in wallets:
+            for idx, w in enumerate(wallets):
                 addr = w["address"]
                 p = persona_engine.generate_persona_for_wallet(addr)
-                if persona_engine.is_active_now(p):
-                    res = executor.run_daily_cycle_for_wallet(addr, respect_active_hours=True)
+                # Cycle 1 runs at least 1 wallet to establish baseline immediately
+                respect_hours = True if cycle_count > 1 else (idx > 0)
+                if not respect_hours or persona_engine.is_active_now(p):
+                    res = executor.run_daily_cycle_for_wallet(addr, respect_active_hours=respect_hours)
                     print(f"Ví {addr[:8]}... ({p['persona_name']}): Điểm +{res.get('points_earned', 0)}")
+
             # 3. Thu hoạch và chuyển vốn
             harvester.route_capital_to_smart_money(profit_share_pct=0.80)
             time.sleep(30)

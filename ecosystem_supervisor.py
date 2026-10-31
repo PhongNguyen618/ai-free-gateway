@@ -1,17 +1,20 @@
-"""Multi-Process Ecosystem Supervisor for Hugging Face Spaces & Cloud 24/7.
+"""Multi-Process Ecosystem Supervisor for Hugging Face Spaces & Render Cloud 24/7.
 
-Orchestrates and monitors:
-1. AI Free Gateway & Agent Hub (:7860)
-2. Airdrop Hunter Agent Daemon
-3. Smart Money Agent Hub Node
+Orchestrates, monitors, and keeps alive:
+1. AI Free Gateway & Agent Hub (:PORT)
+2. Airdrop Hunter Agent Daemon (Auto 0đ Streak & Anti-Sybil)
+3. Smart Money Agent Hub Node (Meme Sniping & Whale Signals)
+4. Anti-Sleep Keep-Alive Loop (Keeps Render Free tier awake 24/7)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -28,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PORT = int(os.getenv("PORT", "7860"))
 GATEWAY_URL = f"http://127.0.0.1:{PORT}"
 GATEWAY_KEY = os.getenv("GATEWAY_API_KEY", "sk-local-dev-token")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://aifreegateway.onrender.com").rstrip("/")
 
 BANNER = rf"""
 ========================================================================
@@ -36,6 +40,7 @@ BANNER = rf"""
     1. AI Free Gateway & All-in-One Hub
     2. Airdrop Hunter Agent Daemon (Auto 0đ Streak & Anti-Sybil)
     3. Smart Money Agent Hub Node (Meme Sniping & Whale Signals)
+    4. Anti-Sleep Keep-Alive (Ping every 8 min)
 ========================================================================
 """
 
@@ -74,6 +79,56 @@ def wait_for_gateway(timeout_sec: float = 20.0) -> bool:
     return False
 
 
+def start_render_keep_alive():
+    """Background thread that pings public URL every 8 minutes to prevent Render Free sleep."""
+    def _ping_loop():
+        # Wait 2 minutes after startup before first ping
+        time.sleep(120)
+        target_url = f"{RENDER_EXTERNAL_URL}/health"
+        print(f"[*] Kích hoạt Anti-Sleep Keep-Alive loop tới: {target_url} (mỗi 480 giây)")
+        while True:
+            try:
+                req = urllib.request.Request(target_url, headers={"User-Agent": "RenderKeepAlive/1.0"})
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    if resp.status == 200:
+                        print(f"[{time.strftime('%H:%M:%S')}] 🟢 Anti-Sleep Ping OK -> {target_url}")
+            except Exception as e:
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Anti-Sleep Ping notice: {e}")
+            time.sleep(480)
+
+    t = threading.Thread(target=_ping_loop, daemon=True, name="RenderKeepAliveThread")
+    t.start()
+
+
+def notify_system_startup():
+    """Publishes system.startup event to Shared Event Bus so Telegram Notifier alerts user."""
+    try:
+        url = f"{GATEWAY_URL}/api/hub/events/publish"
+        payload = {
+            "topic": "system.startup",
+            "source_project": "ecosystem_supervisor",
+            "payload": {
+                "server_url": RENDER_EXTERNAL_URL,
+                "mode": "24/7 Cloud Autonomous",
+                "timestamp": time.time(),
+            },
+            "priority": "high",
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GATEWAY_KEY}",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5.0)
+        print("[*] Đã phát sự kiện 'system.startup' lên Event Bus và Telegram Notifier.")
+    except Exception as e:
+        print(f"[!] Không thể phát system.startup: {e}")
+
+
 def main():
     print(BANNER)
     signal.signal(signal.SIGINT, signal_handler)
@@ -105,6 +160,7 @@ def main():
     print("[*] Đang chờ Gateway sẵn sàng tại port", PORT, "...")
     if wait_for_gateway(timeout_sec=25.0):
         print("    -> Gateway đã ONLINE 100%!")
+        notify_system_startup()
     else:
         print("    -> Cảnh báo: Gateway khởi động chậm hơn dự kiến, tiếp tục chạy các bot vệ tinh...")
 
@@ -131,6 +187,9 @@ def main():
         processes.append(p_smart)
     else:
         print("[!] Không tìm thấy smart_money trong ecosystem, bỏ qua.")
+
+    # 4. Start Render Anti-Sleep Loop
+    start_render_keep_alive()
 
     print("\n" + "=" * 72)
     print("🚀 TOÀN BỘ HỆ SINH THÁI 3 DỰ ÁN ĐANG CHẠY ĐỒNG THỜI 24/7!")

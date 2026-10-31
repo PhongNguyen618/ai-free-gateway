@@ -257,6 +257,29 @@ def build_hub_node(
             "wallets": health_reports,
         }
 
+    # Tool 7: Thêm ví mới vào dàn cày Airdrop
+    @node.tool(
+        name="add_farming_wallet",
+        description="Thêm địa chỉ ví mới vào dàn cày Airdrop, tự động gán nhân cách Persona chống Sybil và khởi tạo chuỗi active.",
+    )
+    def tool_add_farming_wallet(wallet_address: str, chain_type: str = "EVM") -> Dict[str, Any]:
+        addr = str(wallet_address).strip()
+        if not addr or len(addr) < 8:
+            return {"status": "ERROR", "message": "Địa chỉ ví không hợp lệ."}
+        p = persona_engine.generate_persona_for_wallet(addr)
+        db.upsert_wallet(addr, chain_type=chain_type, persona_id=p["archetype_id"], persona_details=p)
+        bal, _ = rpc_client.get_native_balance(chain_type.lower() if "sol" in chain_type.lower() else "base", addr)
+        return {
+            "status": "SUCCESS",
+            "message": f"Đã thêm ví {addr[:8]}... vào dàn cày thành công!",
+            "wallet": addr,
+            "chain_type": chain_type,
+            "persona_name": p["persona_name"],
+            "active_hours": p["active_hours"],
+            "initial_balance": bal,
+            "total_wallets": len(db.list_wallets()),
+        }
+
     return node
 
 

@@ -424,3 +424,64 @@ async def test_shared_event_bus_sqlite_persistence(tmp_path):
     assert len(history) == 2
     assert history[0]["source_project"] == "bot-1"
 
+
+@pytest.mark.asyncio
+async def test_agent_hub_call_and_telegram_endpoints(hub_app):
+    """Verify /api/hub/call and /api/hub/telegram/* endpoints."""
+    app, _ = hub_app
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Telegram status & test
+        r_tel_status = await client.get("/api/hub/telegram/status")
+        assert r_tel_status.status_code == 200
+        assert "is_configured" in r_tel_status.json()
+
+        r_tel_test = await client.post("/api/hub/telegram/test")
+        assert r_tel_test.status_code == 200
+        assert r_tel_test.json()["status"] in ("NOT_CONFIGURED", "SENT", "FAILED")
+
+        # Register a project
+        reg_payload = {
+            "project_id": "direct-worker",
+            "display_name": "Direct Worker",
+            "tools": [{"name": "compute", "description": "Computes something"}],
+        }
+        await client.post("/api/hub/register", json=reg_payload)
+
+        # Background worker responding to heartbeat command
+        async def mock_worker():
+            for _ in range(15):
+                await asyncio.sleep(0.05)
+                hb = await client.post("/api/hub/heartbeat", json={"project_id": "direct-worker"})
+                cmds = hb.json().get("commands", [])
+                for cmd in cmds:
+                    await client.post(
+                        "/api/hub/command/result",
+                        json={
+                            "command_id": cmd["command_id"],
+                            "project_id": "direct-worker",
+                            "status": "success",
+                            "result": {"answer": 42},
+                        },
+                    )
+
+        w_task = asyncio.create_task(mock_worker())
+
+        # Call /api/hub/call
+        r_call = await client.post(
+            "/api/hub/call",
+            json={
+                "project_id": "direct-worker",
+                "tool_name": "compute",
+                "arguments": {"x": 10},
+                "timeout": 5.0,
+            },
+        )
+        await w_task
+
+        assert r_call.status_code == 200
+        data = r_call.json()
+        assert data["status"] == "success"
+        assert data["result"] == {"answer": 42}
+

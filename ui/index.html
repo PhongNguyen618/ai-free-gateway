@@ -286,12 +286,90 @@
 
     <!-- Tab: Agent Hub (All-in-One Multi-Project Center) -->
     <div id="tab-hub" class="hidden" style="display: flex; flex-direction: column; gap: 1.5rem;">
-      <!-- Section 1: Connected Projects -->
+
+      <!-- Section 1: Summary Cloud Monitoring KPI Metrics -->
+      <div class="grid-5" id="hub-kpi-grid">
+        <div class="card">
+          <div class="card-title">💳 Dàn Ví Airdrop (Wallets)</div>
+          <div id="hub-kpi-wallets" class="card-value" style="color: #38bdf8;">--</div>
+          <div class="card-desc" style="color: #64748b;">Ví EVM / Solana</div>
+        </div>
+        <div class="card">
+          <div class="card-title">🌐 Chuỗi Active (Networks)</div>
+          <div id="hub-kpi-chains" class="card-value" style="color: #a78bfa; font-size: 1.125rem; font-weight: 700;">Base • Monad</div>
+          <div class="card-desc" style="color: #64748b;">RPC Mainnet / Testnet</div>
+        </div>
+        <div class="card">
+          <div class="card-title">⭐ Điểm Tích Lũy (XP / Points)</div>
+          <div id="hub-kpi-points" class="card-value" style="color: #34d399;">--</div>
+          <div class="card-desc" style="color: #34d399;">Điểm danh & nhiệm vụ</div>
+        </div>
+        <div class="card">
+          <div class="card-title">💰 Vốn Bơm Sang Smart Money</div>
+          <div id="hub-kpi-capital" class="card-value" style="color: #fbbf24;">--</div>
+          <div class="card-desc" style="color: #fbbf24;">Trích 80% lợi nhuận</div>
+        </div>
+        <div class="card">
+          <div class="card-title">⛽ Gas Base L2 Trung Bình</div>
+          <div id="hub-kpi-gas" class="card-value" style="color: #22d3ee;">--</div>
+          <div class="card-desc" style="color: #22d3ee;">Live RPC gwei</div>
+        </div>
+        <div class="card" style="display: flex; flex-direction: column; justify-content: space-between;">
+          <div>
+            <div class="card-title">📲 Báo Cáo Telegram</div>
+            <div style="margin-top: 0.25rem;">
+              <span id="hub-kpi-telegram-badge" class="badge badge-slate">Đang kiểm tra...</span>
+            </div>
+          </div>
+          <button class="btn btn-emerald" style="margin-top: 0.5rem; font-size: 0.6875rem;" onclick="testTelegramReport()">
+            📲 Test Báo Cáo
+          </button>
+        </div>
+      </div>
+
+      <!-- Section 2: Wallet Balances & Anti-Sybil Personas Table -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">💼 Bảng Giám Sát Số Dư & Lịch Cày Anti-Sybil (Live RPC)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Số dư Native ETH/SOL, Nonce giao dịch, Nhân cách (Persona) phân bổ giờ hoạt động tự nhiên tránh trừng phạt Sybil.</p>
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+            <input type="text" id="hub-new-wallet-addr" class="input-text font-mono" style="margin: 0; width: 220px; font-size: 0.75rem; padding: 0.35rem 0.6rem;" placeholder="0x... hoặc Sol ví...">
+            <select id="hub-new-wallet-chain" class="input-text" style="margin: 0; width: auto; font-size: 0.75rem; padding: 0.35rem 0.6rem; background: #1e293b; color: #e2e8f0; border: 1px solid #334155;">
+              <option value="EVM">EVM (Base/Monad)</option>
+              <option value="SOLANA">Solana</option>
+            </select>
+            <button class="btn btn-slate" onclick="addNewWallet()">➕ Thêm Ví</button>
+            <button class="btn btn-emerald" onclick="refreshWalletBalances()">🔄 Quét Lại On-Chain</button>
+          </div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Địa Chỉ Ví</th>
+                <th>Mạng Lưới</th>
+                <th>Số Dư (Balance)</th>
+                <th>Lượt Tx (Nonce)</th>
+                <th>Nhân Cách (Persona)</th>
+                <th>Khung Giờ Hoạt Động</th>
+                <th>Trạng Thái On-Chain</th>
+              </tr>
+            </thead>
+            <tbody id="hub-wallets-table-body">
+              <tr><td colspan="7" style="text-align: center; color: #64748b; padding: 1.5rem;">Đang tải dữ liệu số dư ví...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Section 3: Connected Projects & 1-Click Interactive Tools -->
       <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
           <div>
-            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">🔌 Các Dự Án Đang Cắm Vào Hub (MCP-Lite Registry)</h3>
-            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Tự động nhận diện dự án con (Smart Money, Scraper, Telegram...) qua nhịp tim Heartbeat và công cụ MCP.</p>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">🔌 Các Dự Án & Công Cụ 1-Chạm (MCP-Lite Registry)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Bấm trực tiếp vào từng công cụ bên dưới để thực thi tức thì (1-Click Run) mà không cần gõ lệnh.</p>
           </div>
           <button class="btn btn-slate" onclick="fetchHubData()">🔄 Làm Mới Hub</button>
         </div>
@@ -300,7 +378,7 @@
         </div>
       </div>
 
-      <!-- Section 2: AI Auto-Orchestrator Console -->
+      <!-- Section 4: AI Auto-Orchestrator Console -->
       <div class="card" style="display: flex; flex-direction: column; gap: 1rem; border: 1px solid rgba(16, 185, 129, 0.3);">
         <div style="display: flex; justify-content: space-between; align-items: center;">
           <div>
@@ -320,8 +398,9 @@
         </div>
 
         <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Chạy chu kỳ cày Airdrop hôm nay cho toàn bộ dàn ví và tóm tắt kết quả')">Lệnh mẫu: Cày Airdrop hôm nay</button>
           <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Kiểm tra rủi ro đồng SOL và tóm tắt tình trạng ví cá mập')">Lệnh mẫu: Kiểm tra SOL</button>
-          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Có sự kiện nóng nào về thị trường crypto hôm nay không?')">Lệnh mẫu: Quét sự kiện</button>
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Quét tín hiệu Meme hot và săn các cặp giao dịch tiềm năng')">Lệnh mẫu: Săn Meme Hot</button>
         </div>
 
         <div style="display: flex; gap: 0.5rem;">
@@ -342,7 +421,7 @@
         </div>
       </div>
 
-      <!-- Section 3: Shared Event Bus Stream -->
+      <!-- Section 5: Shared Event Bus Stream -->
       <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
           <div>
@@ -437,9 +516,10 @@
       <h3 style="font-size: 1.125rem; font-weight: 700; color: #fff;">Gateway API Key</h3>
       <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.5rem;">
         Nhập Gateway Master API Key để xác thực các yêu cầu Dashboard và quản trị duyệt bảo mật.
+        Mặc định hệ thống là <code class="font-mono" style="color: #34d399;">sk-local-dev-token</code>.
         Key được lưu trong bộ nhớ phiên (sessionStorage) của tab này và không được lưu vĩnh viễn.
       </p>
-      <input type="password" id="input-api-key" class="input-text" placeholder="Nhập master API key...">
+      <input type="password" id="input-api-key" class="input-text font-mono" placeholder="sk-local-dev-token (Mặc định)...">
       <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
         <button class="btn btn-slate" onclick="closeAuthModal()">Hủy</button>
         <button class="btn btn-emerald" onclick="saveApiKey()">Lưu và Kết Nối</button>
@@ -457,7 +537,7 @@
     let currentTab = 'tab-models';
 
     function getApiKey() {
-      return sessionStorage.getItem('gateway_api_key') || '';
+      return sessionStorage.getItem('gateway_api_key') || 'sk-local-dev-token';
     }
 
     function setApiKey(key) {
@@ -472,8 +552,10 @@
     function updateAuthStatusUI() {
       const btnText = document.getElementById('auth-status-text');
       const key = getApiKey();
-      if (key) {
-        btnText.textContent = 'Key: Configured';
+      if (key && key !== 'sk-local-dev-token') {
+        btnText.textContent = 'Key: Custom Set';
+      } else if (key === 'sk-local-dev-token') {
+        btnText.textContent = 'Key: Connected (Default)';
       } else {
         btnText.textContent = 'Key: Local Only';
       }
@@ -1230,7 +1312,11 @@
       if (currentTab === 'tab-models') fetchModels();
       if (currentTab === 'tab-dlp') fetchDlpLogs();
       if (currentTab === 'tab-quotas') fetchQuotas();
-      if (currentTab === 'tab-hub') fetchHubData();
+      if (currentTab === 'tab-hub') {
+        fetchHubData();
+        checkTelegramStatus();
+        refreshWalletBalances();
+      }
     }
 
     // --- Live Playground & Provider Ping ---
@@ -1489,14 +1575,17 @@
             toolsDiv.style.marginTop = '0.5rem';
 
             (p.tools || []).forEach(t => {
-              const tSpan = document.createElement('span');
-              tSpan.style.background = '#1e293b';
-              tSpan.style.color = '#38bdf8';
-              tSpan.style.padding = '0.125rem 0.375rem';
-              tSpan.style.borderRadius = '0.25rem';
-              tSpan.style.fontSize = '0.6875rem';
-              tSpan.textContent = `🔧 ${t.name}`;
-              toolsDiv.appendChild(tSpan);
+              const tBtn = document.createElement('button');
+              tBtn.className = 'btn btn-slate';
+              tBtn.style.fontSize = '0.6875rem';
+              tBtn.style.padding = '0.2rem 0.5rem';
+              tBtn.style.color = '#38bdf8';
+              tBtn.style.cursor = 'pointer';
+              tBtn.style.border = '1px solid #334155';
+              tBtn.title = (t.description || t.name) + ' (Bấm 1-chạm để chạy ngay)';
+              tBtn.textContent = `⚡ ${t.name}`;
+              tBtn.onclick = () => executeToolDirectly(p.project_id, t.name, {});
+              toolsDiv.appendChild(tBtn);
             });
             card.appendChild(toolsDiv);
 
@@ -1611,6 +1700,260 @@
         btn.disabled = false;
         btn.textContent = '🚀 Giao Việc Cho AI';
         fetchHubData();
+      }
+    }
+
+    async function checkTelegramStatus() {
+      const badge = document.getElementById('hub-kpi-telegram-badge');
+      if (!badge) return;
+      try {
+        const res = await apiFetch('/api/hub/telegram/status');
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data.is_configured) {
+            badge.className = 'badge badge-emerald';
+            badge.textContent = 'ĐÃ KẾT NỐI (24/7)';
+          } else {
+            badge.className = 'badge badge-amber';
+            badge.textContent = 'CHƯA CẤU HÌNH TOKEN';
+          }
+        }
+      } catch (err) {
+        badge.className = 'badge badge-slate';
+        badge.textContent = 'Chưa kiểm tra';
+      }
+    }
+
+    async function testTelegramReport() {
+      showToast('Đang gửi test thông báo về Telegram...');
+      try {
+        const res = await apiFetch('/api/hub/telegram/test', { method: 'POST' });
+        if (res && res.ok) {
+          const data = await res.json();
+          if (data.status === 'SENT') {
+            showToast('✅ ' + data.message, false);
+          } else if (data.status === 'NOT_CONFIGURED') {
+            showToast('⚠️ ' + data.message, true);
+          } else {
+            showToast('❌ ' + data.message, true);
+          }
+        } else {
+          showToast('Lỗi gửi request test Telegram', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
+      }
+    }
+
+    async function executeToolDirectly(projectId, toolName, args = {}) {
+      const resBox = document.getElementById('hub-orchestrate-result-box');
+      const resAction = document.getElementById('hub-res-action');
+      const resTool = document.getElementById('hub-res-tool');
+      const resOutput = document.getElementById('hub-res-output');
+      const meta = document.getElementById('hub-orchestrate-meta');
+
+      if (resBox) resBox.classList.remove('hidden');
+      if (resAction) resAction.textContent = '1-Click Direct Run';
+      if (resTool) resTool.textContent = `${projectId} ➔ ${toolName}`;
+      if (resOutput) resOutput.textContent = `Đang thực thi công cụ [${toolName}] trên node [${projectId}]...`;
+      if (meta) meta.textContent = `Đang gọi công cụ: ${toolName}`;
+
+      showToast(`Đang chạy: ${toolName}...`);
+
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: projectId,
+            tool_name: toolName,
+            arguments: args,
+            timeout: 35.0,
+          }),
+        });
+
+        if (!resp || !resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          if (resOutput) resOutput.textContent = `[Lỗi thực thi]: ${err.message || err.detail || resp.statusText}`;
+          if (meta) meta.textContent = 'Thất bại';
+          showToast(`Lỗi gọi công cụ ${toolName}`, true);
+          return;
+        }
+
+        const data = await resp.json();
+        if (data.status === 'error') {
+          if (resOutput) resOutput.textContent = `[Lỗi Agent]: ${data.message}`;
+          if (meta) meta.textContent = 'Thất bại';
+          showToast(`Agent báo lỗi: ${data.message}`, true);
+        } else {
+          const resultStr = typeof data.result === 'object' ? JSON.stringify(data.result, null, 2) : String(data.result);
+          if (resOutput) resOutput.textContent = resultStr;
+          if (meta) meta.textContent = `Hoàn tất thành công (${new Date().toLocaleTimeString()})`;
+          showToast(`Thực thi ${toolName} thành công!`);
+
+          if (toolName.includes('wallet') || toolName.includes('farming') || toolName.includes('reward')) {
+            refreshWalletBalances();
+          }
+        }
+      } catch (e) {
+        if (resOutput) resOutput.textContent = `[Lỗi kết nối]: ${e.message}`;
+        if (meta) meta.textContent = 'Gặp lỗi mạng';
+        showToast(`Lỗi kết nối tới Gateway: ${e.message}`, true);
+      } finally {
+        fetchHubData();
+      }
+    }
+
+    async function refreshWalletBalances() {
+      const tbody = document.getElementById('hub-wallets-table-body');
+      try {
+        const resHealth = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'airdrop-hunter-agent',
+            tool_name: 'check_wallet_onchain_health',
+            arguments: { wallet_address: 'ALL', chain: 'base' },
+            timeout: 20.0,
+          }),
+        });
+
+        const resStats = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'airdrop-hunter-agent',
+            tool_name: 'get_farming_stats',
+            arguments: {},
+            timeout: 20.0,
+          }),
+        });
+
+        if (resStats && resStats.ok) {
+          const statsData = await resStats.json();
+          if (statsData.status === 'success' && statsData.result) {
+            const r = statsData.result;
+            const wEl = document.getElementById('hub-kpi-wallets');
+            if (wEl) wEl.textContent = `${r.total_wallets || 0} ví`;
+            const pEl = document.getElementById('hub-kpi-points');
+            if (pEl) pEl.textContent = `${(r.total_points_accumulated || 0).toLocaleString()} pts`;
+            const cEl = document.getElementById('hub-kpi-capital');
+            if (cEl) cEl.textContent = `$${(r.total_capital_routed_usd || 0).toFixed(2)}`;
+          }
+        }
+
+        if (resHealth && resHealth.ok) {
+          const healthData = await resHealth.json();
+          if (healthData.status === 'success' && healthData.result) {
+            const h = healthData.result;
+            const gEl = document.getElementById('hub-kpi-gas');
+            if (gEl) gEl.textContent = `${(h.network_gas_price_gwei || 0.005).toFixed(4)} gwei`;
+
+            if (tbody) {
+              tbody.textContent = '';
+              const wallets = h.wallets || [];
+              if (wallets.length === 0) {
+                const tr = document.createElement('tr');
+                const td = createEl('td', '', 'Chưa có ví nào trong danh sách. Hãy thêm ví bằng form trên.');
+                td.colSpan = 7;
+                td.style.textAlign = 'center';
+                td.style.color = '#64748b';
+                td.style.padding = '1.5rem';
+                tr.appendChild(td);
+                tbody.appendChild(tr);
+              } else {
+                wallets.forEach(w => {
+                  const tr = document.createElement('tr');
+
+                  const tdAddr = document.createElement('td');
+                  tdAddr.className = 'font-mono';
+                  tdAddr.style.fontWeight = '600';
+                  tdAddr.style.color = '#38bdf8';
+                  const shortAddr = w.address.length > 14 ? `${w.address.slice(0, 6)}...${w.address.slice(-4)}` : w.address;
+                  tdAddr.textContent = shortAddr;
+                  tdAddr.title = w.address;
+                  tr.appendChild(tdAddr);
+
+                  const tdChain = document.createElement('td');
+                  const chainBadge = createEl('span', 'badge badge-slate', (w.chain || 'base').toUpperCase());
+                  tdChain.appendChild(chainBadge);
+                  tr.appendChild(tdChain);
+
+                  const tdBal = document.createElement('td');
+                  tdBal.className = 'font-mono';
+                  tdBal.style.fontWeight = '700';
+                  tdBal.style.color = '#cbd5e1';
+                  tdBal.textContent = `${Number(w.balance || 0).toFixed(4)} ETH`;
+                  tr.appendChild(tdBal);
+
+                  const tdNonce = document.createElement('td');
+                  tdNonce.className = 'font-mono';
+                  tdNonce.textContent = String(w.transaction_count || 0);
+                  tr.appendChild(tdNonce);
+
+                  const tdPersona = document.createElement('td');
+                  tdPersona.style.color = '#a78bfa';
+                  tdPersona.textContent = w.persona_archetype || 'DeFi Farmer';
+                  tr.appendChild(tdPersona);
+
+                  const tdWindow = document.createElement('td');
+                  const winBadge = createEl('span', w.is_active_window_now ? 'badge badge-emerald' : 'badge badge-slate', w.is_active_window_now ? 'ĐANG ACTIVE' : 'Chờ khung giờ');
+                  tdWindow.appendChild(winBadge);
+                  tr.appendChild(tdWindow);
+
+                  const tdRpc = document.createElement('td');
+                  const rpcBadge = createEl('span', w.is_live_rpc ? 'badge badge-emerald' : 'badge badge-amber', w.is_live_rpc ? 'LIVE RPC' : 'FALLBACK');
+                  tdRpc.appendChild(rpcBadge);
+                  tr.appendChild(tdRpc);
+
+                  tbody.appendChild(tr);
+                });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error('refreshWalletBalances error:', err);
+      }
+    }
+
+    async function addNewWallet() {
+      const addrInput = document.getElementById('hub-new-wallet-addr');
+      const chainInput = document.getElementById('hub-new-wallet-chain');
+      const addr = (addrInput ? addrInput.value : '').trim();
+      const chain = (chainInput ? chainInput.value : 'EVM').trim();
+
+      if (!addr || addr.length < 8) {
+        showToast('Vui lòng nhập địa chỉ ví hợp lệ!', true);
+        return;
+      }
+
+      showToast('Đang thêm ví và thiết lập nhân cách Anti-Sybil...');
+      try {
+        const resp = await apiFetch('/api/hub/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: 'airdrop-hunter-agent',
+            tool_name: 'add_farming_wallet',
+            arguments: { wallet_address: addr, chain_type: chain },
+          }),
+        });
+
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          if (data.status === 'success') {
+            showToast('Đã thêm ví mới thành công!');
+            if (addrInput) addrInput.value = '';
+            refreshWalletBalances();
+          } else {
+            showToast(data.message || 'Không thể thêm ví', true);
+          }
+        } else {
+          showToast('Lỗi gọi API thêm ví', true);
+        }
+      } catch (err) {
+        showToast('Lỗi kết nối: ' + err.message, true);
       }
     }
 
