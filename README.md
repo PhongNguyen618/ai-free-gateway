@@ -1,3 +1,15 @@
+---
+title: Ai Free Gateway
+emoji: 🚀
+colorFrom: green
+colorTo: green
+sdk: gradio
+app_file: app.py
+pinned: false
+license: mit
+short_description: All in one agent hub
+---
+
 # AI Free Gateway 🛡️⚡
 
 > **Local Zero-Trust OpenAI-Compatible Proxy & Free-Tier AI Harvester**  
