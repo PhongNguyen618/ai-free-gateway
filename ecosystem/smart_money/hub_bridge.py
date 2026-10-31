@@ -333,13 +333,42 @@ def start_hub_bridge():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     print("=" * 60)
-    print("SMART MONEY AGENT - HUB BRIDGE NODE")
+    print("SMART MONEY AGENT - HUB BRIDGE NODE (24/7 AUTO-TP & MOONBAG)")
     print("=" * 60)
     start_hub_bridge()
-    print("Node đang hoạt động và gửi nhịp tim về Gateway. Nhấn Ctrl+C để dừng.")
+
+    # Seed initial position if empty so 24/7 monitoring has active baseline
+    try:
+        if not position_manager.get_open_positions():
+            gems = market_scanner.get_safe_trending_gems(chain="base", limit=1)
+            if gems:
+                g = gems[0]
+                position_manager.open_position(
+                    token_address=g["token_address"],
+                    token_symbol=g["symbol"],
+                    chain=g["chain"],
+                    entry_price_usd=float(g["price_usd"] or 0.0043),
+                    invested_usd=10.0,
+                )
+                logger.info(f"🚀 Khởi tạo vị thế Moonbag tự động: {g['symbol']} tại giá ${g['price_usd']}")
+    except Exception as e:
+        logger.debug(f"Initial position seed skipped: {e}")
+
+    print("Node đang hoạt động và tự động quét giá DexScreener mỗi 30s. Nhấn Ctrl+C để dừng.")
+    last_sync = 0.0
     try:
         while True:
-            time.sleep(1)
+            now = time.time()
+            if now - last_sync >= 30.0:
+                last_sync = now
+                try:
+                    updates = position_manager.sync_live_prices_from_dexscreener()
+                    for u in updates:
+                        if u.get("actions"):
+                            logger.info(f"🎯 [Auto-TP Triggered] {u['symbol']}: {u['actions']}")
+                except Exception as e:
+                    logger.debug(f"Auto price sync notice: {e}")
+            time.sleep(2)
     except KeyboardInterrupt:
         print("\nĐang dừng node...")
         hub_node.stop()
