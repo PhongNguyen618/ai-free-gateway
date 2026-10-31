@@ -383,3 +383,211 @@ class ReActToolAgent:
             "history": history,
             "actions_executed": action_history,
         }
+
+
+class AgentHubNode:
+    """
+    Plug-and-Play Hub Node for projects to join the AI Free Gateway All-in-One Hub.
+    Automatically handles tool registration (MCP-Lite), background heartbeat,
+    command execution, and Shared Event Bus pub/sub.
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        base_url: str = "http://127.0.0.1:8000",
+        api_key: str = "sk-local-dev-token",
+    ):
+        self.project_id = project_id.strip()
+        self.name = name or project_id
+        self.description = description or f"Agent Node for {project_id}"
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or "sk-local-dev-token"
+
+        self._tools: Dict[str, Tuple[Callable, Dict[str, Any]]] = {}
+        self._event_listeners: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
+        self._running = False
+        self._thread: Optional[Any] = None
+        self._last_event_seq = 0
+
+    def tool(self, name: Optional[str] = None, description: Optional[str] = None):
+        """Decorator to expose a Python function as an MCP-Lite tool to the Hub."""
+        def decorator(func: Callable):
+            tool_name = (name or func.__name__).strip()
+            doc = description or (func.__doc__ or "").strip().split("\n")[0] or f"Tool {tool_name}"
+            self._tools[tool_name] = (func, {
+                "name": tool_name,
+                "description": doc,
+                "parameters": {},
+            })
+            return func
+        return decorator
+
+    def on_event(self, topic: str):
+        """Decorator to subscribe to events on the Shared Event Bus."""
+        def decorator(func: Callable[[Dict[str, Any]], None]):
+            clean_topic = topic.strip().lower()
+            if clean_topic not in self._event_listeners:
+                self._event_listeners[clean_topic] = []
+            self._event_listeners[clean_topic].append(func)
+            return func
+        return decorator
+
+    def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "X-Project-ID": self.project_id,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _get(self, path: str) -> Any:
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "X-Project-ID": self.project_id,
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def register(self) -> Dict[str, Any]:
+        """Manually registers this node and all decorated tools with the Gateway."""
+        tools_payload = [meta for _, meta in self._tools.values()]
+        payload = {
+            "project_id": self.project_id,
+            "display_name": self.name,
+            "description": self.description,
+            "tools": tools_payload,
+        }
+        return self._post("/api/hub/register", payload)
+
+    def publish_event(self, topic: str, payload: Dict[str, Any], priority: str = "normal") -> Dict[str, Any]:
+        """Publishes an event to the Gateway Shared Event Bus."""
+        body = {
+            "topic": topic,
+            "source_project": self.project_id,
+            "payload": payload,
+            "priority": priority,
+        }
+        return self._post("/api/hub/events/publish", body)
+
+    def _loop(self, poll_interval: float):
+        import threading
+        logger.info(f"AgentHubNode '{self.project_id}' starting background loop...")
+
+        # Initial registration
+        try:
+            self.register()
+        except Exception as e:
+            logger.warning(f"Initial hub registration error (will retry in loop): {e}")
+
+        while self._running:
+            # 1. Heartbeat & command retrieval
+            try:
+                res = self._post("/api/hub/heartbeat", {"project_id": self.project_id})
+                commands = res.get("commands", [])
+                for cmd in commands:
+                    cid = cmd.get("command_id")
+                    tname = cmd.get("tool_name")
+                    args = cmd.get("arguments", {})
+
+                    if tname in self._tools:
+                        func, _ = self._tools[tname]
+                        try:
+                            if isinstance(args, dict):
+                                out = func(**args) if args else func()
+                            else:
+                                out = func(args)
+                            self._post("/api/hub/command/result", {
+                                "command_id": cid,
+                                "project_id": self.project_id,
+                                "status": "success",
+                                "result": out,
+                            })
+                        except TypeError:
+                            # Fallback positional argument passing
+                            try:
+                                out = func(args)
+                                self._post("/api/hub/command/result", {
+                                    "command_id": cid,
+                                    "project_id": self.project_id,
+                                    "status": "success",
+                                    "result": out,
+                                })
+                            except Exception as ex2:
+                                self._post("/api/hub/command/result", {
+                                    "command_id": cid,
+                                    "project_id": self.project_id,
+                                    "status": "error",
+                                    "error": str(ex2),
+                                })
+                        except Exception as ex:
+                            self._post("/api/hub/command/result", {
+                                "command_id": cid,
+                                "project_id": self.project_id,
+                                "status": "error",
+                                "error": str(ex),
+                            })
+                    else:
+                        self._post("/api/hub/command/result", {
+                            "command_id": cid,
+                            "project_id": self.project_id,
+                            "status": "error",
+                            "error": f"Tool '{tname}' not found on project node '{self.project_id}'.",
+                        })
+            except Exception as e:
+                logger.debug(f"Heartbeat loop tick error on '{self.project_id}': {e}")
+
+            # 2. Event poll
+            if self._event_listeners:
+                try:
+                    evts = self._get(f"/api/hub/events/poll?since_sequence={self._last_event_seq}")
+                    if isinstance(evts, list):
+                        for ev in evts:
+                            seq = ev.get("sequence", 0)
+                            if seq > self._last_event_seq:
+                                self._last_event_seq = seq
+
+                            top = ev.get("topic", "").lower()
+                            # Match exact or wildcard
+                            for reg_topic, funcs in self._event_listeners.items():
+                                if reg_topic == top or (reg_topic.endswith("*") and top.startswith(reg_topic[:-1])):
+                                    for fn in funcs:
+                                        try:
+                                            fn(ev)
+                                        except Exception as eh:
+                                            logger.warning(f"Error executing event handler: {eh}")
+                except Exception as e:
+                    logger.debug(f"Event poll tick error on '{self.project_id}': {e}")
+
+            time.sleep(poll_interval)
+
+    def start_background(self, poll_interval: float = 2.0) -> None:
+        """Starts the background worker thread for automatic heartbeat and dispatching."""
+        import threading
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, args=(poll_interval,), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stops the background node thread."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+

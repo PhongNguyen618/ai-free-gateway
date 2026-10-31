@@ -224,6 +224,10 @@
       <button onclick="switchTab('tab-dlp')" id="btn-tab-dlp" class="tab-btn">
         <span>🛡️ DLP Audit Logs</span>
       </button>
+      <button onclick="switchTab('tab-hub')" id="btn-tab-hub" class="tab-btn">
+        <span>🤖 Agent Hub (Trung Tâm Dự Án)</span>
+        <span id="badge-tab-hub-count" class="badge badge-emerald">0 Online</span>
+      </button>
       <button onclick="switchTab('tab-playground')" id="btn-tab-playground" class="tab-btn">
         <span>💬 Playground & Ping Test</span>
       </button>
@@ -278,6 +282,93 @@
     <!-- Tab 4: Provider Quotas -->
     <div id="tab-quotas" class="hidden">
       <div id="quotas-container" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem;"></div>
+    </div>
+
+    <!-- Tab: Agent Hub (All-in-One Multi-Project Center) -->
+    <div id="tab-hub" class="hidden" style="display: flex; flex-direction: column; gap: 1.5rem;">
+      <!-- Section 1: Connected Projects -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">🔌 Các Dự Án Đang Cắm Vào Hub (MCP-Lite Registry)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Tự động nhận diện dự án con (Smart Money, Scraper, Telegram...) qua nhịp tim Heartbeat và công cụ MCP.</p>
+          </div>
+          <button class="btn btn-slate" onclick="fetchHubData()">🔄 Làm Mới Hub</button>
+        </div>
+        <div id="hub-projects-container" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem;">
+          <div style="font-size: 0.75rem; color: #64748b; padding: 1rem 0;">Chưa có dự án nào kết nối. Hãy khởi động node dự án với `AgentHubNode`.</div>
+        </div>
+      </div>
+
+      <!-- Section 2: AI Auto-Orchestrator Console -->
+      <div class="card" style="display: flex; flex-direction: column; gap: 1rem; border: 1px solid rgba(16, 185, 129, 0.3);">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #34d399; display: flex; align-items: center; gap: 0.5rem;">
+              🧠 AI Trưởng Phòng Điều Phối (Master Orchestrator)
+              <span class="badge badge-emerald">Autonomous</span>
+            </h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Ra lệnh bằng tiếng Việt. AI sẽ tự động phân tích, chọn đúng công cụ của dự án con và tổng hợp kết quả.</p>
+          </div>
+          <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <select id="hub-model-tier" class="input-text" style="width: auto; padding: 0.25rem 0.5rem; font-size: 0.75rem; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 0.375rem;">
+              <option value="reasoning">Tier: Reasoning (DeepSeek R1 / QwQ)</option>
+              <option value="fast">Tier: Fast (Gemini Flash / Groq)</option>
+              <option value="coding">Tier: Coding (Qwen Coder)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Kiểm tra rủi ro đồng SOL và tóm tắt tình trạng ví cá mập')">Lệnh mẫu: Kiểm tra SOL</button>
+          <button class="btn btn-slate" style="font-size: 0.6875rem;" onclick="setHubPrompt('Có sự kiện nóng nào về thị trường crypto hôm nay không?')">Lệnh mẫu: Quét sự kiện</button>
+        </div>
+
+        <div style="display: flex; gap: 0.5rem;">
+          <textarea id="hub-orchestrate-input" rows="2" class="input-text" style="width: 100%; resize: vertical; background: #0b0f19; color: #e2e8f0; border: 1px solid #1e293b; border-radius: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.8125rem; font-family: inherit;" placeholder="Gõ yêu cầu công việc cho AI Trưởng phòng tại đây..."></textarea>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div id="hub-orchestrate-meta" style="font-size: 0.75rem; color: #64748b; font-family: monospace;">Sẵn sàng nhận lệnh</div>
+          <button class="btn btn-emerald" id="hub-orchestrate-btn" onclick="sendHubOrchestrate()">🚀 Giao Việc Cho AI</button>
+        </div>
+
+        <div id="hub-orchestrate-result-box" class="hidden" style="background: #020617; border: 1px solid #1e293b; border-radius: 0.5rem; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #94a3b8; border-bottom: 1px solid #1e293b; padding-bottom: 0.5rem;">
+            <span>Hành động: <strong id="hub-res-action" style="color: #38bdf8;">--</strong></span>
+            <span>Công cụ: <strong id="hub-res-tool" style="color: #a78bfa;">--</strong></span>
+          </div>
+          <div id="hub-res-output" style="font-size: 0.8125rem; color: #e2e8f0; white-space: pre-wrap; line-height: 1.6;"></div>
+        </div>
+      </div>
+
+      <!-- Section 3: Shared Event Bus Stream -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+          <div>
+            <h3 style="font-size: 0.875rem; font-weight: 700; color: #fff;">📡 Bảng Tin Chung Liên Dự Án (Shared Event Bus)</h3>
+            <p style="font-size: 0.75rem; color: #94a3b8; margin-top: 0.25rem;">Xem các Agent đăng tín hiệu và tự phản xạ phối hợp với nhau theo thời gian thực.</p>
+          </div>
+          <span id="hub-events-count" class="badge badge-slate">0 Sự kiện</span>
+        </div>
+        <div class="table-container" style="max-height: 320px; overflow-y: auto;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 80px;">Seq</th>
+                <th>Topic</th>
+                <th>Nguồn (Source)</th>
+                <th>Độ Ưu Tiên</th>
+                <th>Dữ Liệu (Payload)</th>
+                <th>Thời Gian</th>
+              </tr>
+            </thead>
+            <tbody id="hub-events-table-body">
+              <tr><td colspan="6" style="text-align: center; color: #64748b; padding: 1rem;">Chưa có sự kiện nào được phát.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <!-- Tab 5: Playground & Ping Test -->
@@ -442,9 +533,10 @@
 
     function switchTab(tabId) {
       currentTab = tabId;
-      ['tab-approvals', 'tab-models', 'tab-dlp', 'tab-quotas', 'tab-playground'].forEach(id => {
+      ['tab-approvals', 'tab-models', 'tab-dlp', 'tab-quotas', 'tab-hub', 'tab-playground'].forEach(id => {
         const el = document.getElementById(id);
         const btn = document.getElementById('btn-' + id);
+        if (!el || !btn) return;
         if (id === tabId) {
           el.classList.remove('hidden');
           btn.classList.add('active');
@@ -1138,6 +1230,7 @@
       if (currentTab === 'tab-models') fetchModels();
       if (currentTab === 'tab-dlp') fetchDlpLogs();
       if (currentTab === 'tab-quotas') fetchQuotas();
+      if (currentTab === 'tab-hub') fetchHubData();
     }
 
     // --- Live Playground & Provider Ping ---
@@ -1314,6 +1407,210 @@
       } finally {
         sendBtn.disabled = false;
         sendBtn.textContent = '🚀 Gửi Yêu Cầu';
+      }
+    }
+
+    // --- Agent Hub Logic ---
+
+    function setHubPrompt(text) {
+      const input = document.getElementById('hub-orchestrate-input');
+      if (input) input.value = text;
+    }
+
+    async function fetchHubData() {
+      try {
+        const [pRes, eRes] = await Promise.all([
+          apiFetch('/api/hub/projects'),
+          apiFetch('/api/hub/events/history?limit=30')
+        ]);
+        if (pRes.ok && eRes.ok) {
+          const projects = await pRes.json();
+          const events = await eRes.json();
+          renderHub(projects, events);
+        }
+      } catch (err) {
+        console.error('fetchHubData error:', err);
+      }
+    }
+
+    function renderHub(projects, events) {
+      // Update badge count
+      const onlineCount = (projects || []).filter(p => p.status === 'online').length;
+      const badge = document.getElementById('badge-tab-hub-count');
+      if (badge) badge.textContent = `${onlineCount} Online`;
+
+      // Render projects
+      const pContainer = document.getElementById('hub-projects-container');
+      if (pContainer) {
+        pContainer.textContent = '';
+        if (!projects || projects.length === 0) {
+          const emptyDiv = createEl('div', '', 'Chưa có dự án nào cắm vào. Chạy AgentHubNode trong dự án con để kết nối.');
+          emptyDiv.style.fontSize = '0.75rem';
+          emptyDiv.style.color = '#64748b';
+          emptyDiv.style.padding = '1rem 0';
+          pContainer.appendChild(emptyDiv);
+        } else {
+          projects.forEach(p => {
+            const card = document.createElement('div');
+            card.style.background = '#020617';
+            card.style.border = p.status === 'online' ? '1px solid rgba(16, 185, 129, 0.4)' : '1px solid #1e293b';
+            card.style.borderRadius = '0.5rem';
+            card.style.padding = '0.75rem 1rem';
+
+            const top = document.createElement('div');
+            top.style.display = 'flex';
+            top.style.justifyContent = 'space-between';
+            top.style.alignItems = 'center';
+
+            const title = document.createElement('strong');
+            title.style.color = '#fff';
+            title.style.fontSize = '0.875rem';
+            title.textContent = p.display_name || p.project_id;
+
+            const st = document.createElement('span');
+            st.className = p.status === 'online' ? 'badge badge-emerald' : 'badge badge-slate';
+            st.textContent = (p.status || 'offline').toUpperCase();
+
+            top.appendChild(title);
+            top.appendChild(st);
+            card.appendChild(top);
+
+            const desc = document.createElement('div');
+            desc.style.fontSize = '0.75rem';
+            desc.style.color = '#94a3b8';
+            desc.style.margin = '0.35rem 0';
+            desc.textContent = p.description || p.project_id;
+            card.appendChild(desc);
+
+            const toolsDiv = document.createElement('div');
+            toolsDiv.style.display = 'flex';
+            toolsDiv.style.flexWrap = 'wrap';
+            toolsDiv.style.gap = '0.35rem';
+            toolsDiv.style.marginTop = '0.5rem';
+
+            (p.tools || []).forEach(t => {
+              const tSpan = document.createElement('span');
+              tSpan.style.background = '#1e293b';
+              tSpan.style.color = '#38bdf8';
+              tSpan.style.padding = '0.125rem 0.375rem';
+              tSpan.style.borderRadius = '0.25rem';
+              tSpan.style.fontSize = '0.6875rem';
+              tSpan.textContent = `🔧 ${t.name}`;
+              toolsDiv.appendChild(tSpan);
+            });
+            card.appendChild(toolsDiv);
+
+            pContainer.appendChild(card);
+          });
+        }
+      }
+
+      // Render events
+      const eCount = document.getElementById('hub-events-count');
+      if (eCount) eCount.textContent = `${events.length} Sự kiện`;
+
+      const tbody = document.getElementById('hub-events-table-body');
+      if (tbody) {
+        tbody.textContent = '';
+        if (!events || events.length === 0) {
+          const tr = document.createElement('tr');
+          const td = createEl('td', '', 'Chưa có sự kiện nào được phát.');
+          td.colSpan = 6;
+          td.style.textAlign = 'center';
+          td.style.color = '#64748b';
+          td.style.padding = '1rem';
+          tr.appendChild(td);
+          tbody.appendChild(tr);
+        } else {
+          events.slice().reverse().forEach(ev => {
+            const tr = document.createElement('tr');
+
+            const tdSeq = document.createElement('td');
+            tdSeq.className = 'font-mono';
+            tdSeq.textContent = '#' + ev.sequence;
+            tr.appendChild(tdSeq);
+
+            const tdTopic = document.createElement('td');
+            tdTopic.style.fontWeight = '600';
+            tdTopic.style.color = '#38bdf8';
+            tdTopic.textContent = ev.topic;
+            tr.appendChild(tdTopic);
+
+            const tdSource = document.createElement('td');
+            tdSource.textContent = ev.source_project;
+            tr.appendChild(tdSource);
+
+            const tdPrio = document.createElement('td');
+            tdPrio.textContent = (ev.priority || 'normal').toUpperCase();
+            tr.appendChild(tdPrio);
+
+            const tdPayload = document.createElement('td');
+            tdPayload.className = 'font-mono truncate';
+            tdPayload.style.maxWidth = '300px';
+            tdPayload.textContent = JSON.stringify(ev.payload);
+            tr.appendChild(tdPayload);
+
+            const tdTime = document.createElement('td');
+            tdTime.style.color = '#94a3b8';
+            tdTime.style.fontSize = '0.75rem';
+            tdTime.textContent = new Date(ev.timestamp * 1000).toLocaleTimeString();
+            tr.appendChild(tdTime);
+
+            tbody.appendChild(tr);
+          });
+        }
+      }
+    }
+
+    async function sendHubOrchestrate() {
+      const input = document.getElementById('hub-orchestrate-input');
+      const btn = document.getElementById('hub-orchestrate-btn');
+      const meta = document.getElementById('hub-orchestrate-meta');
+      const resBox = document.getElementById('hub-orchestrate-result-box');
+      const resAction = document.getElementById('hub-res-action');
+      const resTool = document.getElementById('hub-res-tool');
+      const resOutput = document.getElementById('hub-res-output');
+      const tierSelect = document.getElementById('hub-model-tier');
+
+      const query = (input ? input.value : '').trim();
+      if (!query) {
+        showToast('Vui lòng nhập lệnh cho AI Trưởng phòng!', true);
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = 'Đang điều phối...';
+      meta.textContent = 'AI đang phân tích và chọn công cụ phù hợp...';
+      resBox.classList.remove('hidden');
+      resOutput.textContent = 'Đang giao việc tới các node dự án...';
+
+      try {
+        const tier = tierSelect ? tierSelect.value : 'reasoning';
+        const resp = await apiFetch('/api/hub/orchestrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: query, model_tier: tier }),
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          resOutput.textContent = `[Lỗi điều phối]: ${err.detail || resp.statusText}`;
+          meta.textContent = 'Gặp lỗi';
+          return;
+        }
+
+        const data = await resp.json();
+        resAction.textContent = data.plan_action || 'direct_answer';
+        resTool.textContent = data.tool_called || 'Không cần công cụ';
+        resOutput.textContent = data.final_answer || 'Không có câu trả lời.';
+        meta.textContent = `Hoàn tất | Đã phối hợp với ${data.online_projects_count || 0} dự án online`;
+      } catch (e) {
+        resOutput.textContent = '[Lỗi kết nối]: ' + e.message;
+        meta.textContent = 'Thất bại';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '🚀 Giao Việc Cho AI';
+        fetchHubData();
       }
     }
 
